@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:apple-intelligence-foundation-server}",
+            "name": "Debug FoundationsServer",
+            "target": "FoundationsServer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug FoundationsServer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:apple-intelligence-foundation-server}",
+            "name": "Release FoundationsServer",
+            "target": "FoundationsServer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release FoundationsServer"
+        }
+    ]
+}
