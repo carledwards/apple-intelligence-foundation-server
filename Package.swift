@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "FoundataionsServer",
+    name: "FoundationsServer",
     platforms: [
         .macOS("26.0")
     ],
