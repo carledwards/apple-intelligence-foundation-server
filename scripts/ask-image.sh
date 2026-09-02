@@ -75,7 +75,7 @@ import json, os, sys
 raw = sys.stdin.read().strip()
 if not raw:
     sys.exit("error: no response from " + os.environ.get("SERVER", "http://localhost:8080")
-             + " — is the server running? (swift run)")
+             + " — is the server running? (swift run --package-path Server)")
 try:
     data = json.loads(raw)
 except ValueError:

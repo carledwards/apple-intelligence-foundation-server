@@ -14,11 +14,15 @@ This package is intended for experimentation and local development with Apple In
 
 ## Requirements
 
-- **macOS 26.0+** (or iOS 26.0+, iPadOS 26.0+, visionOS 26.0+)
-- **macOS 27.0+** for image input and for `/status` to report the model variant
+- **macOS 27.0+** to run the server
+- **iOS 27.0+** for anything linking `FoundationCore` directly
 - **Swift 6.2+**
 - **Apple Intelligence enabled** on your device
-- **Xcode 26+** (Xcode 27 for the macOS 27 SDK)
+- **Xcode 27+** (for the macOS 27 / iOS 27 SDKs)
+
+The floor is 27 on purpose. This targets the current on-device models, so the
+back-compatibility paths that used to report `variant: null` and refuse images on
+macOS 26 have been removed rather than carried forward.
 
 > Only devices that support Apple Intelligence can use this server. You must enable Apple Intelligence in System Settings.
 
@@ -28,25 +32,49 @@ This package is intended for experimentation and local development with Apple In
 
 ```text
 apple-intelligence-foundation-server/
-├── Package.swift              # Swift Package Manager configuration
-├── Sources/
-│   └── App/
-│       └── command.swift      # Server implementation
+├── Core/                           # FoundationCore — the model layer
+│   ├── Package.swift               #   no dependencies at all
+│   └── Sources/FoundationCore/
+│       ├── InferenceService.swift  #   sessions, image prompting, classification
+│       ├── InferenceError.swift    #   every error this package throws
+│       ├── InferenceLog.swift      #   JSONL request log
+│       ├── Models.swift            #   request/response types
+│       └── JSONValue.swift         #   arbitrary caller metadata
+├── Server/                         # FoundationServer — the HTTP interface
+│   ├── Package.swift               #   depends on ../Core and Vapor
+│   └── Sources/FoundationServer/
+│       ├── App.swift               #   routes and startup
+│       └── HTTP.swift              #   Content conformances, error mapping
 ├── scripts/
-│   ├── ask-image.sh           # Send an image + prompt from the shell
-│   └── classify.sh            # Batch-classify images; tune your label set
+│   ├── ask-image.sh                # Send an image + prompt from the shell
+│   └── classify.sh                 # Batch-classify images; tune your label set
 └── README.md
 ```
+
+### Why two packages
+
+`Core` holds everything that talks to the model and has **no dependencies**, so a
+SwiftUI app can link it directly and skip the HTTP hop entirely. `Server` is a
+thin translation layer: it decodes JSON, calls `Core`, and maps
+`InferenceError` onto status codes.
+
+The split is by *manifest*, not just by directory, and that is the point. SwiftPM
+resolves a dependency's entire manifest graph rather than only the products you
+consume — a target depending on a Vapor-declaring package checks out Vapor and
+its transitive dependencies (measured: 29 packages, 177 MB) even when it links
+none of them. Keeping Vapor out of `Core/Package.swift` keeps it out of every
+app that links `FoundationCore`.
 
 ---
 
 ## Installation
 
 1. Clone or navigate to the project directory
-2. Resolve dependencies:
+2. Resolve the server's dependencies:
    ```bash
-   swift package resolve
+   swift package resolve --package-path Server
    ```
+   `Core` has no dependencies, so there is nothing to resolve for it.
 
 ---
 
@@ -55,7 +83,7 @@ apple-intelligence-foundation-server/
 ### Running the server
 
 ```bash
-swift run
+swift run --package-path Server
 ```
 
 The server will start on:
@@ -178,10 +206,10 @@ curl -s -X POST http://localhost:8080/inference \
 # {"response":"I DO NOT KNOW.","session_id":"A7089C54-..."}
 ```
 
-#### Image input (macOS 27+)
+#### Image input
 
-On macOS 27 the on-device model accepts images. Attach one or more via the
-`images` array; check `supports_vision` on `/status` first.
+The on-device model accepts images. Attach one or more via the `images` array;
+check `supports_vision` on `/status` first.
 
 Each entry's `data` is base64-encoded bytes in any format ImageIO reads (PNG,
 JPEG, HEIC, …). A full `data:image/png;base64,...` URL is also accepted, so
@@ -246,8 +274,8 @@ later text-only turn can still refer back to an image from an earlier turn.
 Requests carrying images are much larger than text, so the server accepts bodies
 up to **32 MB**. Base64 inflates the payload by roughly 4/3 over the raw bytes.
 
-Sending `images` on macOS 26, or to a model variant that reports no vision
-capability, returns `400` rather than silently dropping them.
+Sending `images` to a model variant that reports no vision capability returns
+`400` rather than silently dropping them.
 
 ---
 
@@ -443,11 +471,10 @@ curl http://localhost:8080/status
 }
 ```
 
-`variant` is the display name of the on-device model variant. It is `null` on
-macOS 26, which has no API to report it.
+`variant` is the display name of the on-device model variant.
 
-`context_size` is read from the model rather than hardcoded. macOS 26 reports a
-fixed 4096; macOS 27 reports the real size (8192 on current hardware).
+`context_size` is read from the model rather than hardcoded — 8192 on current
+hardware. Read it from the endpoint instead of assuming it.
 
 ---
 
@@ -592,7 +619,7 @@ default** — without it the server never writes prompts, responses, or metadata
 anywhere.
 
 ```bash
-LOG_FILE=./inference.jsonl swift run
+LOG_FILE=./inference.jsonl swift run --package-path Server
 ```
 
 ```json
@@ -649,12 +676,15 @@ It cannot be reconstructed later, so log `metadata` from the first event.
 
 ## Implementation Details
 
-- **Web framework**: [Vapor](https://github.com/vapor/vapor) 4.89.0
+- **Web framework**: [Vapor](https://github.com/vapor/vapor) 4.89.0, in `Server` only
 - **AI integration**: `FoundationModels` framework (Apple's on-device language model)
 - **Architecture**: Async/await with Actor-based inference service for concurrency safety
+- **Model**: `SystemLanguageModel.default` — on device. Private Cloud Compute is
+  deliberately not used; a cloud fallback would mask the local failures this is
+  built to surface.
 - **Port**: 8080 (default Vapor HTTP port)
-- **Context window**: reported by `/status` as `context_size` — 4096 tokens on
-  macOS 26, 8192 on macOS 27. Don't hardcode it; read the endpoint.
+- **Context window**: reported by `/status` as `context_size` — 8192 tokens on
+  current hardware. Don't hardcode it; read the endpoint.
 
 ### Model capabilities
 
@@ -664,7 +694,7 @@ The Apple Intelligence system language model excels at:
 - Entity extraction
 - Creative writing
 - Classification
-- Coarse image understanding (macOS 27+, when `/status` reports `supports_vision`)
+- Coarse image understanding (when `/status` reports `supports_vision`)
 
 **Not suitable for**: Basic math, code generation, complex logical reasoning.
 
@@ -716,23 +746,38 @@ If you get `"Model is unavailable"` errors:
 
 If you encounter module import errors:
 
-1. Ensure you're running **macOS 26.0+** or equivalent platform version
-2. Verify the selected toolchain provides a matching SDK. Building the image
-   support requires the macOS 27 SDK, so point `xcode-select` at an Xcode 27
-   install if you have several side by side:
+1. Ensure you're running **macOS 27.0+**
+2. Verify the selected toolchain provides a **macOS 27 SDK**. This is the most
+   common failure: with an older SDK selected the build dies on
+   `value of type 'SystemLanguageModel' has no member 'variant'` and
+   `cannot find 'Attachment' in scope`. Those symbols are absent from the
+   macOS 26 SDK, and no availability guard helps — `#available` gates runtime
+   behavior, not whether a symbol exists at compile time.
+
+   Check what you have, then select an Xcode that reports 27.x:
    ```bash
-   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+   xcrun --show-sdk-version          # must print 27.x
+   # list installed Xcodes and their versions
+   for x in /Applications/Xcode*.app; do
+       echo "$x $(defaults read "$x/Contents/Info" CFBundleShortVersionString)"
+   done
+   sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer  # adjust path
    sudo xcodebuild -license accept   # if you have never accepted it
-   xcrun --show-sdk-version          # should print 27.x
+   ```
+
+   To switch for one shell instead of system-wide:
+   ```bash
+   export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
    ```
 3. Re-resolve dependencies:
    ```bash
-   swift package resolve
+   swift package resolve --package-path Server
    ```
 4. If necessary, clean and rebuild:
    ```bash
-   swift package clean
-   swift build
+   swift package clean --package-path Server
+   swift build --package-path Core
+   swift build --package-path Server
    ```
 
 ---
