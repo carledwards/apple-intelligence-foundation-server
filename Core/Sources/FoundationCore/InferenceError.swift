@@ -21,6 +21,15 @@ public enum InferenceError: Error, Sendable {
     case schemaConstructionFailed(String)
     /// Every sample came back empty — the model returned nothing to tally.
     case emptyClassification
+    /// The session's transcript no longer fits the model's context window.
+    /// Not a bug to be hidden: it is the constraint a caller most needs to see,
+    /// so both numbers are carried out rather than collapsed into a message.
+    case contextSizeExceeded(used: Int, limit: Int)
+    /// The safety system declined the prompt or the generated answer. A normal
+    /// outcome when probing a model, not a server fault.
+    case contentRefused(String)
+    case rateLimited
+    case timedOut
     case logUnavailable(String)
 
     public var reason: String {
@@ -41,6 +50,14 @@ public enum InferenceError: Error, Sendable {
             return message
         case .emptyClassification:
             return "Classification produced no result"
+        case .contextSizeExceeded(let used, let limit):
+            return "Context exhausted: \(used) tokens used of \(limit). Reset this session or start a new one"
+        case .contentRefused(let message):
+            return message
+        case .rateLimited:
+            return "The model is rate limited. Retry shortly"
+        case .timedOut:
+            return "The model timed out"
         case .logUnavailable(let message):
             return message
         }
@@ -56,6 +73,13 @@ public enum InferenceError: Error, Sendable {
         case .imageDecodingFailed: return 400
         case .schemaConstructionFailed: return 400
         case .emptyClassification: return 500
+        // 413 Content Too Large: the request could not be carried because the
+        // accumulated conversation no longer fits, not because it was malformed.
+        case .contextSizeExceeded: return 413
+        // 422: the request was well formed, the model declined to act on it.
+        case .contentRefused: return 422
+        case .rateLimited: return 429
+        case .timedOut: return 504
         case .logUnavailable: return 500
         }
     }

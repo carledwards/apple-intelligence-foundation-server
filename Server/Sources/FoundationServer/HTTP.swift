@@ -13,14 +13,32 @@ extension StatusResponse: @retroactive Content {}
 extension ClassifyRequest: @retroactive Content {}
 extension ClassifiedSubject: @retroactive Content {}
 extension ClassifyResponse: @retroactive Content {}
+extension ContextUsage: @retroactive Content {}
 
 // MARK: - HTTP-only payloads
 
+/// Optional body on `POST /sessions`. The route still accepts no body at all.
+struct CreateSessionRequest: Content {
+    let instructions: String?
+}
+
 struct CreateSessionResponse: Content {
     let sessionId: String
+    /// Echoed back so a caller can confirm what the session was created with.
+    let instructions: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
+        case instructions
+    }
+
+    /// Written explicitly so `instructions` is always present, `null` when unset,
+    /// rather than vanishing from the response and turning a client's key lookup
+    /// into an error.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(instructions, forKey: .instructions)
     }
 }
 
@@ -30,6 +48,22 @@ struct DeleteSessionResponse: Content {
 
 struct ErrorResponse: Content {
     let error: String
+}
+
+/// Asks what a prompt would cost without spending it.
+struct TokenCountRequest: Content {
+    let prompt: String
+    let images: [ImageInput]?
+}
+
+struct TokenCountResponse: Content {
+    let tokens: Int
+    let contextSize: Int
+
+    enum CodingKeys: String, CodingKey {
+        case tokens
+        case contextSize = "context_size"
+    }
 }
 
 // MARK: - Error Middleware

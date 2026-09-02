@@ -20,6 +20,10 @@ public struct LogRecord: Encodable, Sendable {
     public let ts: String
     public let endpoint: String
     public let sessionId: String?
+    /// The system channel in force for this request. Without it a log line
+    /// cannot be reproduced: the same prompt under different instructions is a
+    /// different experiment.
+    public let instructions: String?
     public let prompt: String?
     public let response: String?
     public let classes: [String]?
@@ -34,6 +38,7 @@ public struct LogRecord: Encodable, Sendable {
         case ts
         case endpoint
         case sessionId = "session_id"
+        case instructions
         case prompt
         case response
         case classes
@@ -49,6 +54,7 @@ public struct LogRecord: Encodable, Sendable {
         ts: String,
         endpoint: String,
         sessionId: String?,
+        instructions: String?,
         prompt: String?,
         response: String?,
         classes: [String]?,
@@ -62,6 +68,7 @@ public struct LogRecord: Encodable, Sendable {
         self.ts = ts
         self.endpoint = endpoint
         self.sessionId = sessionId
+        self.instructions = instructions
         self.prompt = prompt
         self.response = response
         self.classes = classes
@@ -82,6 +89,7 @@ public struct LogRecord: Encodable, Sendable {
         try container.encode(ts, forKey: .ts)
         try container.encode(endpoint, forKey: .endpoint)
         try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(instructions, forKey: .instructions)
         try container.encode(prompt, forKey: .prompt)
         try container.encode(response, forKey: .response)
         try container.encode(classes, forKey: .classes)

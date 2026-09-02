@@ -18,6 +18,10 @@ public actor InferenceService {
     /// would otherwise both reach the same session — which `LanguageModelSession`
     /// rejects as a programmer error.
     private var busySessions: Set<String> = []
+    /// Instructions each session was created with. `LanguageModelSession` fixes
+    /// them at construction, so they are kept here to be reapplied when a session
+    /// is reset — a reset clears the transcript, not the session's configuration.
+    private var sessionInstructions: [String: String] = [:]
     private let log: InferenceLog?
 
     public init(log: InferenceLog? = nil) {
@@ -34,6 +38,7 @@ public actor InferenceService {
     private func record(
         endpoint: String,
         sessionId: String?,
+        instructions: String? = nil,
         prompt: String?,
         response: String?,
         classes: [String]? = nil,
@@ -48,6 +53,7 @@ public actor InferenceService {
             ts: InferenceLog.timestamp(),
             endpoint: endpoint,
             sessionId: sessionId,
+            instructions: instructions,
             prompt: prompt,
             response: response,
             classes: classes,
@@ -100,21 +106,38 @@ public actor InferenceService {
         }
     }
 
-    private func makeSession() -> (id: String, session: LanguageModelSession) {
+    /// Instructions are the model's system channel: set once, applied to every
+    /// turn, and charged to the context budget once rather than per prompt.
+    private static func newSession(instructions: String?) -> LanguageModelSession {
+        guard let instructions, !instructions.isEmpty else { return LanguageModelSession() }
+        return LanguageModelSession(instructions: instructions)
+    }
+
+    private func makeSession(instructions: String?) -> (id: String, session: LanguageModelSession) {
         let id = UUID().uuidString
-        let session = LanguageModelSession()
+        let session = Self.newSession(instructions: instructions)
         sessions[id] = session
         lastAccessed[id] = Date()
+        if let instructions, !instructions.isEmpty {
+            sessionInstructions[id] = instructions
+        }
         return (id, session)
     }
 
-    public func createSession() -> String {
-        makeSession().id
+    public func createSession(instructions: String? = nil) -> String {
+        makeSession(instructions: instructions).id
+    }
+
+    /// What a session was created with, so a UI can show the system channel
+    /// that is steering every answer without having to track it separately.
+    public func instructions(for sessionId: String) -> String? {
+        sessionInstructions[sessionId]
     }
 
     public func deleteSession(_ id: String) {
         sessions.removeValue(forKey: id)
         lastAccessed.removeValue(forKey: id)
+        sessionInstructions.removeValue(forKey: id)
     }
 
     public func cleanupStaleSessions() {
@@ -123,7 +146,49 @@ public actor InferenceService {
         for id in staleIds {
             sessions.removeValue(forKey: id)
             lastAccessed.removeValue(forKey: id)
+            sessionInstructions.removeValue(forKey: id)
         }
+    }
+
+    // MARK: Context accounting
+
+    /// How much of the context window a session has consumed so far.
+    ///
+    /// The count is measured over the session's real transcript rather than
+    /// estimated from message or character counts, so it stays correct as
+    /// images, instructions, and tool definitions are added.
+    public func contextUsage(sessionId: String) async throws -> ContextUsage {
+        guard let session = sessions[sessionId] else {
+            throw InferenceError.sessionNotFound(sessionId)
+        }
+        do {
+            let used = try await model.tokenCount(for: session.transcript)
+            return ContextUsage(used: used, limit: model.contextSize)
+        } catch {
+            // Measured on macOS 27.0: counting throws ModelManagerError 1001 once
+            // the transcript holds an image, while inference on the same session
+            // continues to work. An unmeasurable session is a normal state to
+            // display, not a request failure, so this reports rather than throws.
+            return ContextUsage(
+                used: nil,
+                limit: model.contextSize,
+                note: "Token counting unavailable for this session (\(error.localizedDescription))"
+            )
+        }
+    }
+
+    /// What a prompt would cost before sending it.
+    ///
+    /// Text only. The framework cannot count image attachments — passing one to
+    /// `tokenCount(for:)` fails the same way an image-bearing transcript does —
+    /// so images are rejected here with an explanation instead of an opaque error.
+    public func tokenCount(for prompt: String, images: [ImageInput] = []) async throws -> Int {
+        guard images.isEmpty else {
+            throw InferenceError.invalidRequest(
+                "Token counting does not support images. The model cannot count image attachments; send a text-only prompt"
+            )
+        }
+        return try await model.tokenCount(for: Prompt(prompt))
     }
 
     public func generateResponse(
@@ -132,6 +197,7 @@ public actor InferenceService {
         newSession: Bool = false,
         reset: Bool = false,
         images: [ImageInput] = [],
+        instructions: String? = nil,
         metadata: JSONValue? = nil
     ) async throws -> InferenceResponse {
         let started = Date()
@@ -139,14 +205,20 @@ public actor InferenceService {
         do {
             let response = try await runInference(
                 prompt: prompt, sessionId: sessionId, newSession: newSession,
-                reset: reset, images: images, digests: &digests
+                reset: reset, images: images, instructions: instructions, digests: &digests
             )
-            await record(endpoint: "/inference", sessionId: response.sessionId, prompt: prompt,
+            // Resolve from the session so a continuing turn logs the instructions
+            // already in force, not just the ones passed on this call.
+            let inForce = response.sessionId.flatMap { sessionInstructions[$0] } ?? instructions
+            await record(endpoint: "/inference", sessionId: response.sessionId,
+                         instructions: inForce, prompt: prompt,
                          response: response.response, images: digests, started: started,
                          metadata: metadata, status: 200)
             return response
         } catch {
-            await record(endpoint: "/inference", sessionId: sessionId, prompt: prompt,
+            await record(endpoint: "/inference", sessionId: sessionId,
+                         instructions: sessionId.flatMap { sessionInstructions[$0] } ?? instructions,
+                         prompt: prompt,
                          response: nil, images: digests, started: started,
                          metadata: metadata, status: Self.status(of: error),
                          error: Self.reason(of: error))
@@ -160,6 +232,7 @@ public actor InferenceService {
         newSession: Bool,
         reset: Bool,
         images: [ImageInput],
+        instructions: String?,
         digests: inout [ImageDigest]
     ) async throws -> InferenceResponse {
         guard checkAvailability() else {
@@ -170,6 +243,14 @@ public actor InferenceService {
         }
         guard !(reset && sessionId == nil) else {
             throw InferenceError.invalidRequest("reset requires session_id. To start a fresh session, use new_session")
+        }
+        // A session's instructions are fixed when it is constructed, so they
+        // cannot be changed on an existing one. Saying so is better than
+        // accepting the field and silently ignoring it.
+        if instructions != nil, sessionId != nil {
+            throw InferenceError.invalidRequest(
+                "instructions can only be set when a session is created. Use new_session, or delete this session and make a new one"
+            )
         }
 
         let session: LanguageModelSession
@@ -187,7 +268,9 @@ public actor InferenceService {
             if reset {
                 // Replace the session in place so the caller keeps its id while
                 // the transcript, and the context budget it consumed, are dropped.
-                let fresh = LanguageModelSession()
+                // The instructions it was created with are reapplied: a reset
+                // clears the conversation, not the session's configuration.
+                let fresh = Self.newSession(instructions: sessionInstructions[sessionId])
                 sessions[sessionId] = fresh
                 session = fresh
             } else {
@@ -196,12 +279,12 @@ public actor InferenceService {
             lastAccessed[sessionId] = Date()
             resolvedSessionId = sessionId
         } else if newSession {
-            let created = makeSession()
+            let created = makeSession(instructions: instructions)
             session = created.session
             resolvedSessionId = created.id
         } else {
             // One-shot request: the session is discarded once the response returns.
-            session = LanguageModelSession()
+            session = Self.newSession(instructions: instructions)
             resolvedSessionId = nil
         }
 
@@ -224,7 +307,11 @@ public actor InferenceService {
         digests: inout [ImageDigest]
     ) async throws -> String {
         guard !images.isEmpty else {
-            return try await session.respond(to: prompt).content
+            do {
+                return try await session.respond(to: prompt).content
+            } catch {
+                throw Self.translate(error)
+            }
         }
         guard model.capabilities.contains(.vision) else {
             throw InferenceError.visionUnsupported
@@ -238,11 +325,15 @@ public actor InferenceService {
         digests = decoded.map(\.result.digest)
         let attachments = decoded.map { Attachment($0.result.image).label($0.label) }
 
-        let response = try await session.respond {
-            prompt
-            attachments
+        do {
+            let response = try await session.respond {
+                prompt
+                attachments
+            }
+            return response.content
+        } catch {
+            throw Self.translate(error)
         }
-        return response.content
     }
 
     // MARK: Classification
@@ -336,9 +427,14 @@ public actor InferenceService {
         var rounds: [[String]] = []
         for _ in 0..<samples {
             let session = LanguageModelSession(model: model)
-            let result = try await session.respond(schema: schema) {
-                instruction
-                attachments
+            let result: LanguageModelSession.Response<GeneratedContent>
+            do {
+                result = try await session.respond(schema: schema) {
+                    instruction
+                    attachments
+                }
+            } catch {
+                throw Self.translate(error)
             }
             // Deduplicate within a round so one sample cannot vote twice for the
             // same label, which would inflate its agreement past 1.0.
@@ -378,6 +474,26 @@ public actor InferenceService {
     }
 
     // MARK: Helpers
+
+    /// Lifts the framework's own errors into `InferenceError` where this package
+    /// has something more useful to say. Context exhaustion is the case that
+    /// matters: it carries real numbers, and a caller that only sees a string has
+    /// no way to show how far over the budget it went.
+    private static func translate(_ error: Error) -> Error {
+        guard let modelError = error as? LanguageModelError else { return error }
+        switch modelError {
+        case .contextSizeExceeded(let info):
+            return InferenceError.contextSizeExceeded(used: info.tokenCount, limit: info.contextSize)
+        case .guardrailViolation, .refusal:
+            return InferenceError.contentRefused(modelError.localizedDescription)
+        case .rateLimited:
+            return InferenceError.rateLimited
+        case .timeout:
+            return InferenceError.timedOut
+        default:
+            return error
+        }
+    }
 
     private static func status(of error: Error) -> Int {
         (error as? InferenceError)?.statusCode ?? 500

@@ -23,6 +23,9 @@ public struct InferenceRequest: Codable, Sendable {
     /// budget while keeping the id stable. Requires `sessionId`.
     public let reset: Bool?
     public let images: [ImageInput]?
+    /// The system channel. Only valid alongside `newSession`, or on a one-shot
+    /// request: a session fixes its instructions when it is created.
+    public let instructions: String?
     /// Free-form context recorded in the log and never sent to the model.
     public let metadata: JSONValue?
 
@@ -32,6 +35,7 @@ public struct InferenceRequest: Codable, Sendable {
         case newSession = "new_session"
         case reset
         case images
+        case instructions
         case metadata
     }
 
@@ -41,6 +45,7 @@ public struct InferenceRequest: Codable, Sendable {
         newSession: Bool? = nil,
         reset: Bool? = nil,
         images: [ImageInput]? = nil,
+        instructions: String? = nil,
         metadata: JSONValue? = nil
     ) {
         self.prompt = prompt
@@ -48,6 +53,7 @@ public struct InferenceRequest: Codable, Sendable {
         self.newSession = newSession
         self.reset = reset
         self.images = images
+        self.instructions = instructions
         self.metadata = metadata
     }
 }

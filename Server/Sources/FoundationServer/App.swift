@@ -44,6 +44,7 @@ struct App {
                     newSession: request.newSession ?? false,
                     reset: request.reset ?? false,
                     images: request.images ?? [],
+                    instructions: request.instructions,
                     metadata: request.metadata
                 )
             }
@@ -54,9 +55,15 @@ struct App {
             }
 
             // Session management
-            app.post("sessions") { _ async -> CreateSessionResponse in
-                let id = await inferenceService.createSession()
-                return CreateSessionResponse(sessionId: id)
+            app.post("sessions") { req async -> CreateSessionResponse in
+                // The body is optional: `POST /sessions` with nothing at all is
+                // still the way to get a plain session.
+                let instructions = (try? req.content.decode(CreateSessionRequest.self))?.instructions
+                let id = await inferenceService.createSession(instructions: instructions)
+                return CreateSessionResponse(
+                    sessionId: id,
+                    instructions: await inferenceService.instructions(for: id)
+                )
             }
 
             app.delete("sessions", ":sessionId") { req async throws -> DeleteSessionResponse in
@@ -65,6 +72,28 @@ struct App {
                 }
                 await inferenceService.deleteSession(sessionId)
                 return DeleteSessionResponse(message: "Session deleted")
+            }
+
+            // How much of a session's context budget is spent. Polled by a UI
+            // that wants to show the ceiling approaching rather than only
+            // reporting the crash into it.
+            app.get("sessions", ":sessionId", "context") { req async throws -> ContextUsage in
+                guard let sessionId = req.parameters.get("sessionId") else {
+                    throw Abort(.badRequest, reason: "Missing session ID")
+                }
+                return try await inferenceService.contextUsage(sessionId: sessionId)
+            }
+
+            // What a prompt would cost before sending it.
+            app.post("tokens") { req async throws -> TokenCountResponse in
+                let request = try req.content.decode(TokenCountRequest.self)
+                let tokens = try await inferenceService.tokenCount(
+                    for: request.prompt, images: request.images ?? []
+                )
+                return TokenCountResponse(
+                    tokens: tokens,
+                    contextSize: await inferenceService.status().contextSize
+                )
             }
 
             // Health check endpoint

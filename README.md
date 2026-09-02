@@ -45,6 +45,11 @@ apple-intelligence-foundation-server/
 │   └── Sources/FoundationServer/
 │       ├── App.swift               #   routes and startup
 │       └── HTTP.swift              #   Content conformances, error mapping
+├── App/                            # FoundationApp — the scratchpad UI
+│   ├── Package.swift               #   depends on ../Core; no Vapor
+│   └── Sources/
+│       ├── FoundationAppKit/       #   views and models, builds for macOS + iOS
+│       └── FoundationAppMac/       #   runnable macOS shell
 ├── scripts/
 │   ├── ask-image.sh                # Send an image + prompt from the shell
 │   └── classify.sh                 # Batch-classify images; tune your label set
@@ -92,6 +97,77 @@ The server will start on:
 http://localhost:8080
 ```
 
+### Running the scratchpad app
+
+A SwiftUI client that talks to the model **in process** — no HTTP, no server
+required. It links `FoundationCore` directly, which is the whole reason `Core`
+carries no dependencies.
+
+It carries a live context meter, an editable **Instructions** field for the
+system channel, and a restart that retires the current conversation rather than
+deleting it — so the run that hit a wall stays readable, along with the
+instructions that were steering it.
+
+```bash
+swift run --package-path App FoundationAppMac
+```
+
+#### From Xcode
+
+Open the workspace, not an individual package — it carries all three so you get
+one window with every scheme and can jump between the app, the model layer, and
+the server:
+
+```bash
+open AppleIntelligenceFoundation.xcworkspace
+```
+
+Schemes: `FoundationAppMac` (run the app), `FoundationServer` (run the server),
+plus `FoundationCore` and `FoundationAppKit` for building the libraries alone.
+Pick `FoundationAppMac` / My Mac and Run. Breakpoints and the debugger work
+normally, and `ContextMeter` carries a `#Preview` covering its states — including
+the unmeasurable one — so the meter can be tuned without driving a real session
+into each condition.
+
+Xcode resolves the `../Core` path dependency to the copy already in the
+workspace, so there is no duplicate-package conflict.
+
+`FoundationAppKit` holds every view and builds for iOS as well as macOS, so an
+iOS app target added later links it and supplies only an entry point. The macOS
+executable here is a plain SwiftPM binary rather than a bundled `.app`; that is
+enough to exercise the UI, and a real Xcode app target can come later without
+moving any code.
+
+#### Two things a SwiftPM executable needs that a bundled app gets for free
+
+Both are handled in this package, but they explain code that otherwise looks
+pointless, and they are worth knowing before building any AppKit binary this way.
+
+**An identity.** With no `Info.plist` there is no `CFBundleIdentifier`, and every
+macOS service that looks an app up by bundle ID refuses the connection —
+a wall of `NSCocoaErrorDomain Code=4097` at launch, plus
+`Cannot index window tabs due to missing main bundle identifier`. `Package.swift`
+embeds a plist into the binary's `__TEXT,__info_plist` section with linker flags,
+which grants an identifier without making the binary a bundle. Verified both
+ways: `Bundle.main.bundleIdentifier` is `nil` without the flag and set with it.
+
+**An activation policy.** This one is worse, because it looks like a crash.
+macOS gives an unbundled binary `.prohibited`, meaning it can never be activated
+and gets no Dock icon. SwiftUI builds the scene and the window really is on
+screen — but it sits behind everything and there is no way to reach it, so the
+app appears to start and show nothing. `AppDelegate` claims `.regular`
+explicitly. Measured before and after, same binary otherwise:
+
+| | activation policy | frontmost | on-screen windows |
+|---|---|---|---|
+| Without the delegate | `2` = `.prohibited` | `false` | 1 |
+| With the delegate    | `0` = `.regular`    | `true`  | 1 |
+
+The remaining `com.apple.linkd.autoShortcut` messages are App Intents
+registration failing for an unbundled process. They are noise; nothing in this
+package uses App Intents, and the model is unaffected. A real Xcode app target
+retires all of it.
+
 ---
 
 ## API Overview
@@ -110,8 +186,10 @@ All responses are JSON. Errors are also returned as JSON with a consistent shape
 |--------|--------------------------|---------------------------------------------------|
 | POST   | `/inference`             | Run text (or text + image) generation             |
 | POST   | `/classify`              | Closed-set image classification against your own labels |
-| POST   | `/sessions`              | Create a conversation session                     |
+| POST   | `/sessions`              | Create a conversation session, optionally with instructions |
 | DELETE | `/sessions/{session_id}` | Delete a conversation session                     |
+| GET    | `/sessions/{session_id}/context` | How much of the context window that session has spent |
+| POST   | `/tokens`                | What a prompt would cost, without spending it     |
 | GET    | `/status`                | Report the backing model, context size, and capabilities |
 | GET    | `/health`                | Basic liveness/health check                       |
 
@@ -173,6 +251,47 @@ If the model is not available, you will receive an error response describing the
 
 `new_session` saves a round trip: it replaces `POST /sessions` followed by
 `POST /inference`, and hands back the id in the same response.
+
+#### Instructions — the system channel
+
+`instructions` is a separate channel from the prompt. It is set once, applies to
+every turn in the session, and is charged to the context budget once rather than
+being resent with each prompt.
+
+```bash
+# Create a session with instructions
+curl -X POST http://localhost:8080/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"instructions":"You always answer with exactly one word, in French."}'
+# {"session_id":"F48D7BD9-…","instructions":"You always answer with exactly one word, in French."}
+
+curl -X POST http://localhost:8080/inference \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"What color is the sky?","session_id":"F48D7BD9-…"}'
+# {"response":"Bleu","session_id":"F48D7BD9-…"}
+```
+
+Or in one call, with `new_session` or as a one-shot:
+
+```bash
+curl -X POST http://localhost:8080/inference \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"What color is the sky?","instructions":"Answer with exactly one word in German."}'
+# {"response":"Blau"}
+```
+
+Two rules follow from `LanguageModelSession` fixing its instructions when it is
+constructed:
+
+- **Instructions cannot be changed on an existing session.** Sending them with a
+  `session_id` returns `400` rather than being silently ignored. Start a new
+  session instead.
+- **They survive `reset`.** A reset clears the transcript and frees the context
+  it consumed, but the session keeps its configuration and keeps steering.
+
+Whether a given piece of framing works better as instructions or inside the
+prompt is not obvious and is worth measuring — see
+[Phrasing Changes the Answer](#phrasing-changes-the-answer--test-before-you-trust).
 
 Requests sharing a session must be **sequential**. A second request that arrives
 while the first is still generating gets `409 Conflict`, because the underlying
@@ -450,6 +569,53 @@ agreement is not a guarantee. See
 
 ---
 
+### GET `/sessions/{session_id}/context`
+
+How much of the context window a session has consumed.
+
+```bash
+curl http://localhost:8080/sessions/$SID/context
+```
+
+```json
+{ "used": 200, "limit": 8192, "remaining": 7992, "fraction": 0.0244, "note": null }
+```
+
+`used` is measured over the session's real transcript, not estimated from message
+counts, so it stays correct as instructions and tool definitions are added.
+
+**`used` can be `null`.** The model refuses to count any transcript containing an
+image, and there is no way to ask it to try harder:
+
+```json
+{
+  "used": null, "limit": 8192, "remaining": null, "fraction": null,
+  "note": "Token counting unavailable for this session (… ModelManagerError error 1001 …)"
+}
+```
+
+Inference on that session keeps working normally — only the count is lost. A UI
+showing a context meter needs a fallback (turn count, image count) for any
+conversation that has seen a picture.
+
+---
+
+### POST `/tokens`
+
+What a prompt would cost before you spend it.
+
+```bash
+curl -X POST http://localhost:8080/tokens \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Describe this image in detail please."}'
+# {"tokens":8,"context_size":8192}
+```
+
+Text only. Images are rejected with `400` rather than an opaque failure, for the
+same reason as above: the framework cannot count an attachment.
+
+---
+
 ### GET `/status`
 
 Reports which model is actually serving requests — useful for confirming an OS
@@ -627,6 +793,7 @@ LOG_FILE=./inference.jsonl swift run --package-path Server
   "ts": "2026-09-01T15:27:26.207Z",
   "endpoint": "/classify",
   "session_id": null,
+  "instructions": null,
   "prompt": "Frame from a driveway camera.",
   "response": "none",
   "classes": ["deer","turkey","person","insect","vehicle","none"],
@@ -685,6 +852,11 @@ It cannot be reconstructed later, so log `metadata` from the first event.
 - **Port**: 8080 (default Vapor HTTP port)
 - **Context window**: reported by `/status` as `context_size` — 8192 tokens on
   current hardware. Don't hardcode it; read the endpoint.
+- **Error mapping**: framework errors are translated rather than leaked as `500`.
+  A full context window is `413` and carries both numbers
+  (`Context exhausted: 24203 tokens used of 8192`); a safety refusal is `422`;
+  rate limiting is `429`; a timeout is `504`. When probing a model, a refusal is
+  a result worth recording, not a server fault.
 
 ### Model capabilities
 
