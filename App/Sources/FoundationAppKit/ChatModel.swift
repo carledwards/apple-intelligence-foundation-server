@@ -57,12 +57,27 @@ public final class ChatModel {
 
     private let service: InferenceService
 
+    /// The system prompt a fresh launch starts with. It demonstrates the task
+    /// this model is good at — turning prose into a fixed schema — and works
+    /// on the first message.
+    ///
+    /// The "explicitly says" rule keeps qualifiers out of "dislikes": with the
+    /// rule, "likes eggs, but only scrambled" yields `{"likes":["scrambled
+    /// eggs"]}`; without it, "eggs" lands in the dislikes. The plain key names
+    /// are deliberate — this model reads "dislikes" literally and
+    /// "negative_attribute" loosely.
+    public static let defaultInstructions = """
+        You extract what the user likes and dislikes. Answer only in JSON: \
+        {"likes":[...],"dislikes":[...]}. Only put an item in "dislikes" if the \
+        user explicitly says they don't like it; use [] when empty.
+        """
+
     public private(set) var sessionId: String?
     /// Edited freely; only reaches the model when applied. A session fixes its
     /// instructions at construction, so applying necessarily starts a new one —
     /// the UI says so rather than hiding it.
-    public var instructionsDraft: String = ""
-    public private(set) var appliedInstructions: String?
+    public var instructionsDraft: String = ChatModel.defaultInstructions
+    public private(set) var appliedInstructions: String? = ChatModel.defaultInstructions
     public private(set) var messages: [Message] = []
     public private(set) var retired: [RetiredSession] = []
     public private(set) var usage: ContextUsage?
@@ -102,6 +117,13 @@ public final class ChatModel {
     public func send(_ text: String) async {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty, !isSending else { return }
+
+        // An edited system prompt applies on the first message of a session.
+        // There is no conversation to retire yet, so applying costs nothing,
+        // and the message always runs under the prompt on screen.
+        if instructionsDirty, messages.isEmpty {
+            await applyInstructions()
+        }
         guard let sessionId else { return }
 
         isSending = true
@@ -155,6 +177,26 @@ public final class ChatModel {
         instructionsDraft = instructions ?? ""
         self.sessionId = await service.createSession(instructions: instructions)
         await refreshUsage()
+    }
+
+    /// The current session as plain text. Model and system prompt lead, so
+    /// the transcript carries what is needed to reproduce it.
+    public var transcriptText: String {
+        var lines: [String] = []
+        lines.append("Model: \(status?.variant ?? "unknown")")
+        lines.append("System prompt: \(appliedInstructions ?? "none")")
+        lines.append("")
+        for message in messages {
+            let who: String
+            switch message.kind {
+            case .user: who = "You"
+            case .model: who = "Model"
+            case .failure: who = "Failed"
+            }
+            lines.append("\(who): \(message.text)")
+            lines.append("")
+        }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
     }
 
     public func refreshUsage() async {

@@ -40,6 +40,12 @@ public struct SampleView: View {
                         if model.entries.isEmpty {
                             hint
                         } else {
+                            HStack {
+                                Text("Results")
+                                    .font(.caption.weight(.semibold))
+                                Spacer()
+                                CopyButton(help: "Copy all results as text") { model.resultsText }
+                            }
                             ForEach(model.entries) { entry in
                                 switch entry {
                                 case .run(let run): runCard(run)
@@ -56,6 +62,7 @@ public struct SampleView: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image]) { result in
             if case .success(let url) = result { model.load(url: url) }
         }
+        .task { await model.start() }
     }
 
     /// Never let the panel eat the whole window: results have to stay visible or
@@ -153,7 +160,7 @@ public struct SampleView: View {
     private var controls: some View {
         @Bindable var model = model
         return VStack(alignment: .leading, spacing: 8) {
-            TextField("Instructions (optional) — the system channel",
+            TextField("System prompt (optional)",
                       text: $model.instructions, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)

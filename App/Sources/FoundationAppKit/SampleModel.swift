@@ -126,9 +126,60 @@ public final class SampleModel {
     public static let sweepDimensions = [64, 128, 256, 384, 512, 768, 1024]
     public private(set) var isRunning = false
     public private(set) var failure: String?
+    public private(set) var status: StatusResponse?
 
     public init(service: InferenceService = InferenceService()) {
         self.service = service
+    }
+
+    public func start() async {
+        status = await service.status()
+    }
+
+    /// Every result on screen as plain text, oldest first, so it reads as a log.
+    /// Each entry states its conditions — model, prompt, system prompt, crop,
+    /// resolution — alongside its numbers; a number without its conditions is
+    /// not a result.
+    public var resultsText: String {
+        var lines: [String] = ["Model: \(status?.variant ?? "unknown")", ""]
+        for entry in entries.reversed() {
+            switch entry {
+            case .run(let run):
+                lines.append("Prompt: \(run.prompt)")
+                if let instructions = run.instructions {
+                    lines.append("System prompt: \(instructions)")
+                }
+                if let w = run.sentWidth, let h = run.sentHeight {
+                    let what = run.cropPixels.map { "crop \(Int($0.width))×\(Int($0.height))" } ?? "whole frame"
+                    lines.append("Image: \(run.imageName ?? "image") · \(what) → sent \(w)×\(h)")
+                }
+                if let choices = run.choices {
+                    lines.append("Choices: \(choices.joined(separator: " · "))")
+                }
+                lines.append("Samples: \(run.result.sampleCount) · \(run.result.durationMs) ms")
+                for answer in run.result.answers {
+                    lines.append(Self.answerLine(answer, of: run.result.sampleCount))
+                }
+            case .sweep(let sweep):
+                lines.append("Sweep: \(sweep.axis.rawValue) · held fixed — \(sweep.held)")
+                for step in sweep.steps {
+                    var label = step.label
+                    if sweep.axis == .resolution, let w = step.sentWidth, let h = step.sentHeight {
+                        label += " (\(w)×\(h))"
+                    }
+                    lines.append("  \(label)")
+                    for answer in step.result.answers {
+                        lines.append("  " + Self.answerLine(answer, of: step.result.sampleCount))
+                    }
+                }
+            }
+            lines.append("")
+        }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
+    }
+
+    private static func answerLine(_ answer: SampledAnswer, of total: Int) -> String {
+        "  \(answer.count)/\(total)  \(String(format: "%.2f", answer.agreement))  \(answer.text)"
     }
 
     /// The closed answer set in force, or nil for free text.

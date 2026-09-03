@@ -4,7 +4,10 @@ import FoundationCore
 public struct ChatView: View {
     @State private var model = ChatModel()
     @State private var draft = ""
-    @State private var showInstructions = false
+    // Open by default. The seeded system prompt is the quickest explanation of
+    // what the app is for, and it only explains anything if it can be seen.
+    @State private var showInstructions = true
+    @FocusState private var composerFocused: Bool
 
     public init() {}
 
@@ -17,40 +20,40 @@ public struct ChatView: View {
             composer
         }
         .task { await model.start() }
+        // The system prompt is pre-filled, so the message is the only thing
+        // left to type. Focus starts there.
+        .onAppear { composerFocused = true }
     }
 
     private var header: some View {
+        // The model's name is in the banner above the tabs: it is a fact about
+        // the process, not about this conversation.
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.status?.variant ?? "Loading model…")
-                        .font(.headline)
-                    if let status = model.status, !status.available {
-                        Text(status.message)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+            // Context sits directly under the model banner. Both describe the
+            // model's limits; the system prompt below is the user's own input.
+            ContextMeter(usage: model.usage, turns: model.turnCount)
+            instructionsSection
+            HStack(spacing: 10) {
+                if !model.retired.isEmpty {
+                    Text("\(model.retired.count) retired session\(model.retired.count == 1 ? "" : "s") kept")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
+                CopyButton(help: "Copy the conversation as text") { model.transcriptText }
                 Button("Restart session") {
                     Task { await model.restart() }
                 }
                 .disabled(model.isSending)
             }
-            instructionsSection
-            ContextMeter(usage: model.usage, turns: model.turnCount)
-            if !model.retired.isEmpty {
-                Text("\(model.retired.count) retired session\(model.retired.count == 1 ? "" : "s") kept")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
         }
         .padding(12)
     }
 
-    /// The system channel, kept visible rather than buried in a settings sheet.
-    /// Which framing you put here versus in the prompt changes the answer, so it
-    /// belongs next to the conversation it is steering.
+    /// The system prompt. The Foundation Models API calls it `instructions`;
+    /// the label uses the industry term. It stays visible rather than in a
+    /// settings sheet: which framing goes here versus in the message changes
+    /// the answer, so it belongs next to the conversation it steers.
     @ViewBuilder
     private var instructionsSection: some View {
         @Bindable var model = model
@@ -62,7 +65,7 @@ public struct ChatView: View {
                     HStack(spacing: 4) {
                         Image(systemName: showInstructions ? "chevron.down" : "chevron.right")
                             .font(.caption2)
-                        Text("Instructions")
+                        Text("System prompt")
                             .font(.caption.weight(.semibold))
                     }
                 }
@@ -86,22 +89,44 @@ public struct ChatView: View {
             }
 
             if showInstructions {
-                TextField(
-                    "Applied to every turn, e.g. \"You label camera frames. Answer with one word.\"",
-                    text: $model.instructionsDraft,
-                    axis: .vertical
-                )
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(2...6)
-                .font(.callout)
+                HStack(alignment: .top, spacing: 6) {
+                    TextField(
+                        "Optional, e.g. \"You are a camera-frame labeler. Answer with one word.\"",
+                        text: $model.instructionsDraft,
+                        axis: .vertical
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(2...6)
+                    .font(.callout)
 
-                Text(model.instructionsDirty
-                     ? "Applying starts a new session — a session's instructions are fixed when it is created. The current conversation is retired, not deleted."
-                     : "In force for every turn. Costs context once rather than per prompt, and survives a reset.")
+                    if !model.instructionsDraft.isEmpty {
+                        Button {
+                            model.instructionsDraft = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 5)
+                        .help("Clear the system prompt")
+                    }
+                }
+
+                Text(instructionsHelp)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(model.instructionsDirty && !model.messages.isEmpty ? Color.orange : Color.secondary)
             }
         }
+    }
+
+    private var instructionsHelp: String {
+        if !model.instructionsDirty {
+            return "Sent once at the start of the session and applies to every message. Counted against the context window once, not per message."
+        }
+        if model.messages.isEmpty {
+            return "Applied when you send your first message."
+        }
+        return "Not applied yet. The system prompt is fixed when a session is created, so Apply starts a new session — the current conversation is kept, not deleted."
     }
 
     private var transcript: some View {
@@ -175,6 +200,7 @@ public struct ChatView: View {
             TextField("Ask the on-device model…", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
+                .focused($composerFocused)
                 .onSubmit(send)
             Button("Send", action: send)
                 .keyboardShortcut(.return, modifiers: .command)
@@ -186,6 +212,9 @@ public struct ChatView: View {
     private func send() {
         let text = draft
         draft = ""
+        // Focus stays in the field across a Send click, so the next message
+        // can be typed immediately.
+        composerFocused = true
         Task { await model.send(text) }
     }
 }

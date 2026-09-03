@@ -39,7 +39,7 @@ public struct ContextMeter: View {
                 } else {
                     // The honest fallback. tokenCount refuses any transcript
                     // containing an image, so turns are all that can be counted.
-                    Text("\(turns) turn\(turns == 1 ? "" : "s") · not measurable")
+                    Text("\(turns) message\(turns == 1 ? "" : "s") sent · not measurable")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
