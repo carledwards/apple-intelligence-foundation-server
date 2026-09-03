@@ -14,6 +14,8 @@ extension ClassifyRequest: @retroactive Content {}
 extension ClassifiedSubject: @retroactive Content {}
 extension ClassifyResponse: @retroactive Content {}
 extension ContextUsage: @retroactive Content {}
+extension SampledAnswer: @retroactive Content {}
+extension SampleRun: @retroactive Content {}
 
 // MARK: - HTTP-only payloads
 
@@ -48,6 +50,18 @@ struct DeleteSessionResponse: Content {
 
 struct ErrorResponse: Content {
     let error: String
+}
+
+/// Runs one free-form prompt several times to see how consistent the answer is.
+struct SampleRequest: Content {
+    let prompt: String
+    let images: [ImageInput]?
+    let instructions: String?
+    let samples: Int?
+    /// Constrains the answer to a closed set. Without it the model answers in
+    /// free prose, where counting distinct strings measures wording, not meaning.
+    let choices: [String]?
+    let metadata: JSONValue?
 }
 
 /// Asks what a prompt would cost without spending it.

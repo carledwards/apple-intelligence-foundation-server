@@ -8,8 +8,8 @@ struct FoundationAppMac: App {
 
     var body: some Scene {
         WindowGroup("Foundation Model Scratchpad") {
-            ChatView()
-                .frame(minWidth: 480, minHeight: 520)
+            RootView()
+                .frame(minWidth: 520, minHeight: 620)
         }
     }
 }

@@ -49,6 +49,20 @@ struct App {
                 )
             }
 
+            // Same prompt, N times, grouped by answer. For probing what the
+            // model actually says, where /classify constrains it to a vocabulary.
+            app.post("sample") { req async throws -> SampleRun in
+                let request = try req.content.decode(SampleRequest.self)
+                return try await inferenceService.sample(
+                    prompt: request.prompt,
+                    images: request.images ?? [],
+                    instructions: request.instructions,
+                    samples: request.samples ?? 3,
+                    choices: request.choices,
+                    metadata: request.metadata
+                )
+            }
+
             // Closed-set image classification
             app.post("classify") { req async throws -> ClassifyResponse in
                 try await inferenceService.classify(req.content.decode(ClassifyRequest.self))

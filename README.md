@@ -185,6 +185,7 @@ All responses are JSON. Errors are also returned as JSON with a consistent shape
 | Method | Path                     | Description                                       |
 |--------|--------------------------|---------------------------------------------------|
 | POST   | `/inference`             | Run text (or text + image) generation             |
+| POST   | `/sample`                | Run one free-form prompt N times and group the answers |
 | POST   | `/classify`              | Closed-set image classification against your own labels |
 | POST   | `/sessions`              | Create a conversation session, optionally with instructions |
 | DELETE | `/sessions/{session_id}` | Delete a conversation session                     |
@@ -398,6 +399,72 @@ Sending `images` to a model variant that reports no vision capability returns
 
 ---
 
+### POST `/sample`
+
+Asks the same question several times and groups identical answers. Where
+`/classify` constrains the model to a vocabulary, this leaves the output free —
+it is for finding out what the model actually says, and how much it wavers.
+
+```bash
+curl -X POST http://localhost:8080/sample \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"What animals are in this image?","samples":5,
+       "instructions":"Answer with a comma-separated list of animal names only.",
+       "images":[{"data":"<base64>"}]}'
+```
+
+```json
+{
+  "answers": [
+    {"text": "dog, dog, bird", "count": 3, "agreement": 0.6},
+    {"text": "dog, bird",      "count": 2, "agreement": 0.4}
+  ],
+  "responses": ["dog, dog, bird", "dog, bird", "dog, dog, bird", "dog, dog, bird", "dog, bird"],
+  "sample_count": 5,
+  "duration_ms": 2203
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `prompt` | yes | The question. Must not be empty. |
+| `images` | no | Same shape as `/inference`. Text-only prompts are fine. |
+| `instructions` | no | The system channel, applied to every sample. |
+| `samples` | no | 1–9, default 3. Each runs in its own session so votes stay uncorrelated. |
+| `choices` | no | 2–64 options. Constrains the answer to a closed set, which is what makes agreement mean anything — see below. |
+| `metadata` | no | Recorded in the log, never sent to the model. |
+
+Answers are grouped by a deliberately shallow normalization — casing, surrounding
+whitespace and trailing punctuation only, so `"Bleu"`, `"bleu."` and `" Bleu "`
+count as one. Anything fuzzier would hide real disagreement behind a similarity
+threshold nobody can audit. `responses` always carries the raw, ungrouped output
+so you can check what the grouping did.
+
+**Use `choices` for anything you intend to measure.** Over free prose, agreement
+counts wordings, not meanings. The same question on the same frame:
+
+```text
+"Are there any animals?"  free text, 6 samples
+  0.17  Yes, there are animals in the image.
+  0.17  Yes, there are three animals in the image.
+  0.17  Yes, there are animals in the image. There are four dogs visible.
+  0.17  Yes, there are animals in the image. There are three dogs and one cat.
+  0.17  Yes, there are animals in the image. There are three dogs and one bird.
+  0.17  Yes, there are animals in the image. There are four animals, which appear to be dogs.
+
+"Are there any animals?"  choices: yes, no
+  1.00  (6/6) yes
+```
+
+Six answers that all say *yes* look like total disagreement, because they are six
+distinct strings. Nothing was wrong with the model; the measurement was wrong.
+
+**Full agreement is still not correctness.** With `choices: deer, turkey, dog,
+bird, none` on a frame containing three turkeys, the model answers `dog` 6/6 —
+unanimous, confident, and wrong, with the right answer sitting in the list.
+
+---
+
 ### POST `/classify`
 
 Classifies an image against a label set **you** supply. The model is constrained
@@ -472,8 +539,87 @@ this image", it said NO 0/5. The free-form description explains why:
 
 > "Four black dogs and three trash cans in a driveway with a white pickup truck."
 
-It sees dark turkeys as black dogs. No prompt or schema change fixes that, so do
-not build on species-level labels.
+It sees dark turkeys as black dogs.
+
+**But that is a resolution limit, not a knowledge limit — and cropping fixes it.**
+Every result above sends the whole frame, downscaled to 1024px on the longest
+edge. A turkey in a 3840×2160 driveway shot occupies roughly 40×40 pixels once
+downscaled. Cut the same bird out of the *original* and send it alone:
+
+| Sent | Question | Answer |
+|---|---|---|
+| Whole frame, 1024×576 | "What kind of animal is in this image?" `turkey/dog/deer/bird/cat/none` | `dog` **6/6** |
+| Crop 384×281 of the original | identical question, identical choices | `turkey` **6/6** |
+
+Same model, same prompt, same closed answer set, same photo. Both unanimous.
+The only variable was how many pixels the bird occupied.
+
+So the earlier conclusion — *no prompt or schema change fixes that* — was right
+about prompts and wrong about the cause. The model knows what a turkey is. It
+was never shown one.
+
+**Sending a bigger frame does not help. Only cropping does.** The obvious
+alternative — skip the crop, just upload more pixels — was measured and fails,
+5 samples per row:
+
+| Whole frame sent at | Answer |
+|---|---|
+| 1024×576 | `dog` 5/5 |
+| 1536×864 | `bird` 4/5, `dog` 1/5 |
+| 2048×1152 | `dog` 5/5 |
+| 3840×2160 (untouched original) | `dog` 5/5 |
+
+Four times the resolution, same wrong answer. What matters is how much of the
+*sent frame* the subject occupies, not how many pixels the file contains.
+
+**There is a floor, and it is a gradient rather than a cliff.** Holding the crop
+fixed on one bird and varying only the resolution it is sent at, 5 samples per
+row:
+
+| Crop sent at | Answer |
+|---|---|
+| 384×281 | `turkey` 4/5, `bird` 1/5 |
+| 256×187 | `bird` 3/5, `turkey` 2/5 |
+| 128×94 | `bird` 5/5 |
+| 64×47 | `bird` 5/5 |
+
+Species identification fades in between roughly 256 and 384 px rather than
+switching on. A first pass of this measurement, one run per size, looked like a
+clean break at 384 — running it as a sweep showed `turkey` already appearing 2/5
+at 256. Single runs make gradients look like cliffs.
+
+The failure is graceful: it degrades through `bird`, still a useful answer for a
+false-positive filter, before bottoming out. `dog` only appears when the subject
+is a small part of a wide frame.
+
+**Phrasing still matters after the resolution is fixed.** Same crop, same 384 px,
+same closed answer set — only the wording changing:
+
+| Prompt | Answer |
+|---|---|
+| "Identify the bird in this photo." | `turkey` 5/5 |
+| "This is a driveway camera frame. What animal is it?" | `turkey` 5/5 |
+| "What kind of animal is in this image?" | `turkey` 4/5 |
+| "What species is this?" | `turkey` 3/5 |
+
+Resolution decides whether the answer is *reachable*; phrasing decides how
+reliably you reach it. Note that the prompt naming the wrong species — "identify
+the **bird**" — scored best. Priming the model toward the general category
+appears to help rather than trap it, which is not what you would guess.
+
+**What this means in practice:** do not ask about a whole camera frame, and do
+not bother uploading it at full resolution. Crop to the region of interest, cut
+from the highest-resolution copy you have, and send the crop at **384 px or
+larger** on its longest edge. If your camera already reports a motion box, feed
+that box in as the crop — it costs nothing and is the difference between `dog`
+and `turkey`.
+
+One caveat on all of the above: these are 5-sample measurements, and the
+`bird 4/5` at 1536 px breaks the pattern in row two. Re-measure on your own
+frames rather than treating these numbers as constants.
+
+The app's Image tab does exactly this: drag a selection, and the crop is cut from
+the full-resolution original rather than the displayed copy.
 
 **`dog` came back at `agreement 1.0` and was wrong** — twelve consecutive samples
 agreed on an animal that was not there. This is the caveat above made concrete:
@@ -756,6 +902,31 @@ with itself.
 
 Use low agreement as a signal that something needs attention. Never read high
 agreement as confirmation that an answer is right.
+
+### Don't use the model to judge its own output
+
+The obvious fix for prose answers is to ask the model whether two answers mean
+the same thing, and group by that. It does not hold up. Four comparisons, six
+samples each, using `choices: same, different`:
+
+| Answers being compared | Question asked | Correct | Model said |
+|---|---|---|---|
+| "there are animals" vs "there are two dogs" | Are there any animals? | same | `same` 6/6 |
+| "there are two dogs" vs "there are three dogs" | Are there any animals? | same | **`different` 6/6** |
+| "there are animals" vs "there are no animals" | Are there any animals? | different | `different` 6/6 |
+| "there are two dogs" vs "there are five dogs" | How many animals? | different | `different` 6/6 |
+
+It handles the easy cases and fails the one a judge would exist for: same answer
+to the question actually asked, different wording. It fixated on `two` vs
+`three` and ignored the question. And it failed **unanimously**, so sampling the
+judge would not have caught it — the error is systematic, not noisy.
+
+Four comparisons is not a study, but the failing case is the motivating case. A
+judge built on this model imports exactly the unreliability you are trying to
+measure, and hides it behind a number that looks rigorous. A closed answer set
+costs nothing, is deterministic, and is auditable.
+
+---
 
 ### How to actually test a change
 

@@ -336,6 +336,196 @@ public actor InferenceService {
         }
     }
 
+    // MARK: Sampling
+
+    /// Runs the same free-form prompt several times and reports how consistent
+    /// the answers were.
+    ///
+    /// Unlike `classify`, nothing constrains the output to a vocabulary — this is
+    /// for probing what the model actually says. Each sample runs in its own
+    /// session so the votes stay uncorrelated; reusing one session would let the
+    /// first answer bias the rest, which measures the transcript rather than the
+    /// prompt.
+    public func sample(
+        prompt: String,
+        images: [ImageInput] = [],
+        instructions: String? = nil,
+        samples: Int = 3,
+        choices: [String]? = nil,
+        metadata: JSONValue? = nil
+    ) async throws -> SampleRun {
+        let started = Date()
+        var digests: [ImageDigest] = []
+        do {
+            let run = try await runSamples(
+                prompt: prompt, images: images, instructions: instructions,
+                samples: samples, choices: choices, started: started, digests: &digests
+            )
+            await record(endpoint: "/sample", sessionId: nil, instructions: instructions,
+                         prompt: prompt,
+                         response: run.answers.map { "\($0.text) (\($0.count)/\(run.sampleCount))" }
+                             .joined(separator: " | "),
+                         images: digests, started: started, metadata: metadata, status: 200)
+            return run
+        } catch {
+            await record(endpoint: "/sample", sessionId: nil, instructions: instructions,
+                         prompt: prompt, response: nil, images: digests, started: started,
+                         metadata: metadata, status: Self.status(of: error),
+                         error: Self.reason(of: error))
+            throw error
+        }
+    }
+
+    private func runSamples(
+        prompt: String,
+        images: [ImageInput],
+        instructions: String?,
+        samples: Int,
+        choices: [String]?,
+        started: Date,
+        digests: inout [ImageDigest]
+    ) async throws -> SampleRun {
+        guard checkAvailability() else {
+            throw InferenceError.modelUnavailable(getAvailabilityMessage())
+        }
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw InferenceError.invalidRequest("prompt must not be empty")
+        }
+        guard (1...9).contains(samples) else {
+            throw InferenceError.invalidRequest("samples must be between 1 and 9")
+        }
+        if let choices {
+            guard choices.count >= 2 else {
+                throw InferenceError.invalidRequest("choices must contain at least 2 options")
+            }
+            guard choices.count <= 64 else {
+                throw InferenceError.invalidRequest("choices must contain at most 64 options")
+            }
+            guard Set(choices).count == choices.count else {
+                throw InferenceError.invalidRequest("choices must not contain duplicates")
+            }
+            guard !choices.contains(where: { $0.trimmingCharacters(in: .whitespaces).isEmpty }) else {
+                throw InferenceError.invalidRequest("choices must not contain empty options")
+            }
+        }
+        if !images.isEmpty {
+            guard model.capabilities.contains(.vision) else {
+                throw InferenceError.visionUnsupported
+            }
+        }
+
+        // A closed answer set makes agreement mean something. Over free prose it
+        // does not: six answers that all say "yes, there are animals" differ only
+        // in wording, and counting distinct strings reports that as total
+        // disagreement. Constraining the output is the honest way to measure
+        // whether the model is consistent about the *answer*.
+        let schema = try choices.map { try Self.choiceSchema(for: $0) }
+
+        var responses: [String] = []
+        for _ in 0..<samples {
+            let session = Self.newSession(instructions: instructions)
+            var perRun: [ImageDigest] = []
+            if let schema {
+                responses.append(
+                    try await respondWithChoices(
+                        in: session, to: prompt, images: images, schema: schema, digests: &perRun
+                    )
+                )
+            } else {
+                responses.append(
+                    try await respond(in: session, to: prompt, images: images, digests: &perRun)
+                )
+            }
+            // Identical every round; recorded once rather than N times.
+            if digests.isEmpty { digests = perRun }
+        }
+
+        // Group by normalized form, keeping first-seen order and raw text.
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        var display: [String: String] = [:]
+        for response in responses {
+            let key = SampleRun.key(for: response)
+            if counts[key] == nil {
+                order.append(key)
+                display[key] = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            counts[key, default: 0] += 1
+        }
+
+        // Most agreed first; ties keep the order the model produced them in, so
+        // repeated runs of the same data render stably.
+        let answers = order
+            .sorted { lhs, rhs in
+                let (l, r) = (counts[lhs] ?? 0, counts[rhs] ?? 0)
+                if l != r { return l > r }
+                return (order.firstIndex(of: lhs) ?? 0) < (order.firstIndex(of: rhs) ?? 0)
+            }
+            .map { key in
+                SampledAnswer(
+                    text: display[key] ?? key,
+                    count: counts[key] ?? 0,
+                    agreement: Double(counts[key] ?? 0) / Double(samples)
+                )
+            }
+
+        return SampleRun(
+            answers: answers,
+            responses: responses,
+            sampleCount: samples,
+            durationMs: Int(Date().timeIntervalSince(started) * 1000)
+        )
+    }
+
+    private static func choiceSchema(for choices: [String]) throws -> GenerationSchema {
+        do {
+            let choice = DynamicGenerationSchema(
+                name: "answer",
+                description: "The answer to the question",
+                anyOf: choices
+            )
+            return try GenerationSchema(
+                root: DynamicGenerationSchema(name: "Answer", properties: [
+                    .init(name: "answer", schema: choice)
+                ]),
+                dependencies: []
+            )
+        } catch {
+            throw InferenceError.schemaConstructionFailed("Could not build a schema from choices: \(error)")
+        }
+    }
+
+    private func respondWithChoices(
+        in session: LanguageModelSession,
+        to prompt: String,
+        images: [ImageInput],
+        schema: GenerationSchema,
+        digests: inout [ImageDigest]
+    ) async throws -> String {
+        let attachments: [Attachment<ImageAttachmentContent>]
+        if images.isEmpty {
+            attachments = []
+        } else {
+            guard model.capabilities.contains(.vision) else {
+                throw InferenceError.visionUnsupported
+            }
+            let decoded = try images.enumerated().map { index, image in
+                (result: try Self.decodeImage(image, at: index), label: image.label ?? "image \(index + 1)")
+            }
+            digests = decoded.map(\.result.digest)
+            attachments = decoded.map { Attachment($0.result.image).label($0.label) }
+        }
+        do {
+            let result = try await session.respond(schema: schema) {
+                prompt
+                attachments
+            }
+            return try result.content.value(String.self, forProperty: "answer")
+        } catch {
+            throw Self.translate(error)
+        }
+    }
+
     // MARK: Classification
 
     public func classify(_ request: ClassifyRequest) async throws -> ClassifyResponse {
