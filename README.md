@@ -59,6 +59,7 @@ apple-intelligence-foundation-server/
 ├── scripts/
 │   ├── ask-image.sh                # Send an image + prompt from the shell
 │   └── classify.sh                 # Batch-classify images; tune your label set
+├── docs/screenshots/               # the four images in this README
 └── README.md
 ```
 
@@ -125,6 +126,28 @@ Text shows the same model answering the same message in prose.
 ```bash
 swift run --package-path App FoundationAppMac
 ```
+
+<table>
+  <tr>
+    <td align="center"><b>Chat</b> — a kitchen helper answering as JSON</td>
+    <td align="center"><b>Image</b> — the same question three times, agreement measured</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/mac-chat.png" width="560" alt="Chat tab on macOS: system prompt, JSON schema editor, and a structured answer listing red salsa ingredients with quantities"></td>
+    <td><img src="docs/screenshots/mac-image.png" width="560" alt="Image tab on macOS: a photo of two dogs and a cat, a JSON schema, and results showing a 2-of-3 split between answers"></td>
+  </tr>
+</table>
+
+The same message on the same phone, on-device model on the left and Private
+Cloud Compute on the right. The schema guarantees the shape either way; what
+the larger model adds is the detail inside it.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/iphone-chat-on-device.png" width="280" alt="Chat tab on iPhone using the on-device model: pumpkin pie with four loosely specified ingredients"></td>
+    <td><img src="docs/screenshots/iphone-chat-private-cloud.png" width="280" alt="Chat tab on iPhone using Private Cloud Compute: pumpkin pie with nine fully specified ingredients"></td>
+  </tr>
+</table>
 
 #### From Xcode
 
