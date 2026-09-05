@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreTransferable
 import ImageIO
 import UniformTypeIdentifiers
 import FoundationCore
@@ -55,6 +56,17 @@ public struct LoadedImage: Sendable {
             throw ImageLoading.Failure.emptySelection
         }
         return try ImageLoading.make(from: cut, maxDimension: maxDimension)
+    }
+}
+
+/// An image taken from the clipboard, as the bytes of whatever image format
+/// it was in. `PasteButton` needs a `Transferable`; this one accepts any
+/// `.image` content and hands the data to `ImageLoading` unchanged.
+public struct PastedImage: Transferable, Sendable {
+    public let data: Data
+
+    public static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .image) { PastedImage(data: $0) }
     }
 }
 

@@ -149,13 +149,34 @@ public struct SampleView: View {
                 dropWell
                     .onTapGesture { picking = true }
                 #else
-                // The photo library is where an iPhone's images are; the Files
-                // picker is a poor fit there. Drop still works on iPad.
+                // The photo library is where an iPhone's images are, so the
+                // well itself opens it. Files and the clipboard are the row
+                // below. Drop still works on iPad.
                 PhotosPicker(selection: $photoItem, matching: .images) { dropWell }
                     .buttonStyle(.plain)
                 #endif
+                sourcesRow
             }
         }
+    }
+
+    /// The other ways in. `PasteButton` enables itself only while the
+    /// clipboard holds an image, and reads it without the paste permission
+    /// prompt that `UIPasteboard` access would raise.
+    private var sourcesRow: some View {
+        HStack(spacing: 12) {
+            #if !os(macOS)
+            Button("Files…") { picking = true }
+            #endif
+            PasteButton(payloadType: PastedImage.self) { items in
+                guard let first = items.first else { return }
+                model.load(data: first.data, name: "pasted image")
+            }
+            .labelStyle(.titleOnly)
+            Spacer()
+        }
+        .font(.caption)
+        .controlSize(.small)
     }
 
     private var dropWell: some View {
@@ -166,7 +187,7 @@ public struct SampleView: View {
             VStack(spacing: 4) {
                 Image(systemName: "photo.on.rectangle.angled").font(.title2)
                 #if os(macOS)
-                Text("Drop an image, or click to choose").font(.caption)
+                Text("Drop an image, or click to choose a file").font(.caption)
                 #else
                 Text("Tap to choose a photo").font(.caption)
                 #endif
