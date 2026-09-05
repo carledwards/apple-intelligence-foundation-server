@@ -10,4 +10,10 @@
    <FileRef
       location = "group:App">
    </FileRef>
+   <FileRef
+      location = "group:iOS/FoundationAppiOS.xcodeproj">
+   </FileRef>
+   <FileRef
+      location = "group:macOS/FoundationAppMacOS.xcodeproj">
+   </FileRef>
 </Workspace>

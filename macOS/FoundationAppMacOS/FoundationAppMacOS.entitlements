@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Private Cloud Compute needs com.apple.developer.private-cloud-compute.
+	The developer portal does not yet provision it for a Mac App ID, and
+	automatic signing fails outright when an entitlement cannot be put in
+	the profile. Without it, InferenceService reports the cloud model as
+	unavailable and the app never offers it. Add the key back once the
+	capability appears on the App ID in the portal:
+
+	<key>com.apple.developer.private-cloud-compute</key>
+	<true/>
+	-->
+</dict>
+</plist>

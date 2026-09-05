@@ -26,6 +26,14 @@ public struct InferenceRequest: Codable, Sendable {
     /// The system channel. Only valid alongside `newSession`, or on a one-shot
     /// request: a session fixes its instructions when it is created.
     public let instructions: String?
+    /// Which model answers. Defaults to on-device. Like `instructions`, fixed
+    /// when a session is created: sending a different one with `sessionId`
+    /// is an error rather than a silent switch.
+    public let model: ModelChoice?
+    /// When set, the response is a JSON object with exactly these fields,
+    /// produced by guided generation. Per request, not per session: the same
+    /// session can answer in prose on one turn and structured on the next.
+    public let schema: OutputSchema?
     /// Free-form context recorded in the log and never sent to the model.
     public let metadata: JSONValue?
 
@@ -36,6 +44,8 @@ public struct InferenceRequest: Codable, Sendable {
         case reset
         case images
         case instructions
+        case model
+        case schema
         case metadata
     }
 
@@ -46,6 +56,8 @@ public struct InferenceRequest: Codable, Sendable {
         reset: Bool? = nil,
         images: [ImageInput]? = nil,
         instructions: String? = nil,
+        model: ModelChoice? = nil,
+        schema: OutputSchema? = nil,
         metadata: JSONValue? = nil
     ) {
         self.prompt = prompt
@@ -54,6 +66,8 @@ public struct InferenceRequest: Codable, Sendable {
         self.reset = reset
         self.images = images
         self.instructions = instructions
+        self.model = model
+        self.schema = schema
         self.metadata = metadata
     }
 }
@@ -76,9 +90,12 @@ public struct InferenceResponse: Codable, Sendable {
 }
 
 public struct StatusResponse: Codable, Sendable {
+    /// Which model this describes.
+    public let model: ModelChoice
     public let available: Bool
     public let message: String
-    /// Display name of the on-device model variant, e.g. "AFM 3 Core Advanced".
+    /// Display name of the model variant, e.g. "AFM 3 Core Advanced" on
+    /// device. Private Cloud Compute does not name its variant.
     public let variant: String
     public let contextSize: Int
     public let supportsVision: Bool
@@ -86,6 +103,7 @@ public struct StatusResponse: Codable, Sendable {
     public let supportsReasoning: Bool
 
     enum CodingKeys: String, CodingKey {
+        case model
         case available
         case message
         case variant
@@ -96,6 +114,7 @@ public struct StatusResponse: Codable, Sendable {
     }
 
     public init(
+        model: ModelChoice,
         available: Bool,
         message: String,
         variant: String,
@@ -104,6 +123,7 @@ public struct StatusResponse: Codable, Sendable {
         supportsGuidedGeneration: Bool,
         supportsReasoning: Bool
     ) {
+        self.model = model
         self.available = available
         self.message = message
         self.variant = variant
@@ -128,6 +148,8 @@ public struct ClassifyRequest: Codable, Sendable {
     /// Most labels a single sample may return, 1–10 (default 5). Set to 1 to
     /// force a single best label instead of everything visible.
     public let maxLabels: Int?
+    /// Which model classifies. Defaults to on-device.
+    public let model: ModelChoice?
     public let metadata: JSONValue?
 
     enum CodingKeys: String, CodingKey {
@@ -136,6 +158,7 @@ public struct ClassifyRequest: Codable, Sendable {
         case hint
         case samples
         case maxLabels = "max_labels"
+        case model
         case metadata
     }
 
@@ -145,6 +168,7 @@ public struct ClassifyRequest: Codable, Sendable {
         hint: String? = nil,
         samples: Int? = nil,
         maxLabels: Int? = nil,
+        model: ModelChoice? = nil,
         metadata: JSONValue? = nil
     ) {
         self.classes = classes
@@ -152,6 +176,7 @@ public struct ClassifyRequest: Codable, Sendable {
         self.hint = hint
         self.samples = samples
         self.maxLabels = maxLabels
+        self.model = model
         self.metadata = metadata
     }
 }

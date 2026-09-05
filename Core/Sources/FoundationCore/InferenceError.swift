@@ -29,6 +29,9 @@ public enum InferenceError: Error, Sendable {
     /// outcome when probing a model, not a server fault.
     case contentRefused(String)
     case rateLimited
+    /// Private Cloud Compute declined the request because the app's quota is
+    /// spent. Carries the framework's message, which names the reset window.
+    case quotaExceeded(String)
     case timedOut
     case logUnavailable(String)
 
@@ -56,6 +59,8 @@ public enum InferenceError: Error, Sendable {
             return message
         case .rateLimited:
             return "The model is rate limited. Retry shortly"
+        case .quotaExceeded(let message):
+            return message
         case .timedOut:
             return "The model timed out"
         case .logUnavailable(let message):
@@ -79,6 +84,7 @@ public enum InferenceError: Error, Sendable {
         // 422: the request was well formed, the model declined to act on it.
         case .contentRefused: return 422
         case .rateLimited: return 429
+        case .quotaExceeded: return 429
         case .timedOut: return 504
         case .logUnavailable: return 500
         }

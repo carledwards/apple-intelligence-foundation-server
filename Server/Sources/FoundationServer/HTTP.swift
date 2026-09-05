@@ -22,16 +22,20 @@ extension SampleRun: @retroactive Content {}
 /// Optional body on `POST /sessions`. The route still accepts no body at all.
 struct CreateSessionRequest: Content {
     let instructions: String?
+    /// Which model the session runs on, for its whole life. Default on-device.
+    let model: ModelChoice?
 }
 
 struct CreateSessionResponse: Content {
     let sessionId: String
     /// Echoed back so a caller can confirm what the session was created with.
     let instructions: String?
+    let model: ModelChoice
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case instructions
+        case model
     }
 
     /// Written explicitly so `instructions` is always present, `null` when unset,
@@ -41,6 +45,7 @@ struct CreateSessionResponse: Content {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(sessionId, forKey: .sessionId)
         try container.encode(instructions, forKey: .instructions)
+        try container.encode(model, forKey: .model)
     }
 }
 
@@ -61,6 +66,11 @@ struct SampleRequest: Content {
     /// Constrains the answer to a closed set. Without it the model answers in
     /// free prose, where counting distinct strings measures wording, not meaning.
     let choices: [String]?
+    /// Constrains the answer to a JSON object with these fields. Exclusive
+    /// with `choices`.
+    let schema: OutputSchema?
+    /// Which model to sample. Default on-device.
+    let model: ModelChoice?
     let metadata: JSONValue?
 }
 

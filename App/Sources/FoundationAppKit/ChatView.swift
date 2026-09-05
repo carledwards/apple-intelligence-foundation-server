@@ -6,8 +6,12 @@ public struct ChatView: View {
     @State private var draft = ""
     // Open by default. The seeded system prompt is the quickest explanation of
     // what the app is for, and it only explains anything if it can be seen.
+    // On a phone it is collapsed to one line instead: expanded, it and the
+    // keyboard leave no room for the conversation.
     @State private var showInstructions = true
+    @State private var showSchema = true
     @FocusState private var composerFocused: Bool
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     public init() {}
 
@@ -22,17 +26,23 @@ public struct ChatView: View {
         .task { await model.start() }
         // The system prompt is pre-filled, so the message is the only thing
         // left to type. Focus starts there.
-        .onAppear { composerFocused = true }
+        .onAppear {
+            if sizeClass == .compact {
+                showInstructions = false
+                showSchema = false
+            }
+            composerFocused = true
+        }
     }
 
     private var header: some View {
-        // The model's name is in the banner above the tabs: it is a fact about
-        // the process, not about this conversation.
         VStack(alignment: .leading, spacing: 8) {
-            // Context sits directly under the model banner. Both describe the
+            modelSection
+            // Context sits directly under the model row. Both describe the
             // model's limits; the system prompt below is the user's own input.
             ContextMeter(usage: model.usage, turns: model.turnCount)
             instructionsSection
+            outputSection
             HStack(spacing: 10) {
                 if !model.retired.isEmpty {
                     Text("\(model.retired.count) retired session\(model.retired.count == 1 ? "" : "s") kept")
@@ -119,6 +129,68 @@ public struct ChatView: View {
         }
     }
 
+    /// Changing the model starts a new session, like changing the system
+    /// prompt: a session is bound to its model when it is created.
+    @ViewBuilder
+    private var modelSection: some View {
+        @Bindable var model = model
+        ModelMenu(
+            selection: $model.selectedModel,
+            models: model.availableModels,
+            status: model.status,
+            disabled: model.isSending
+        )
+        .onChange(of: model.selectedModel) {
+            Task { await model.modelChanged() }
+        }
+    }
+
+    /// Text or JSON. JSON is guided generation: the framework builds the
+    /// object and the model fills in the values, so the shape is guaranteed.
+    /// Text leaves the model free, which is also where prompted JSON goes
+    /// wrong — the two modes on the same prompt show the difference.
+    @ViewBuilder
+    private var outputSection: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showSchema.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: showSchema ? "chevron.down" : "chevron.right")
+                            .font(.caption2)
+                        Text("Output")
+                            .font(.caption.weight(.semibold))
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Picker("", selection: $model.structuredOutput) {
+                    Text("Text").tag(false)
+                    Text("JSON").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .controlSize(.small)
+
+                if !showSchema, model.structuredOutput {
+                    Text(model.schemaSummary)
+                        .font(.caption)
+                        .foregroundStyle(model.schemaProblem == nil ? .secondary : Color.orange)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer()
+            }
+
+            if showSchema, model.structuredOutput {
+                SchemaEditor(text: $model.schemaText, problem: model.schemaProblem)
+            }
+        }
+    }
+
     private var instructionsHelp: String {
         if !model.instructionsDirty {
             return "Sent once at the start of the session and applies to every message. Counted against the context window once, not per message."
@@ -154,12 +226,10 @@ public struct ChatView: View {
     @ViewBuilder
     private func bubble(_ message: ChatModel.Message) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(label(for: message.kind))
+            Text(label(for: message))
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(color(for: message.kind))
-            Text(message.text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            AnswerText(text: message.text)
 
             // A context failure is the one case worth acting on directly, so the
             // remedy sits on the message instead of in a separate alert.
@@ -176,11 +246,12 @@ public struct ChatView: View {
             }
         }
         .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(color(for: message.kind).opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func label(for kind: ChatModel.Kind) -> String {
-        switch kind {
+    private func label(for message: ChatModel.Message) -> String {
+        switch message.kind {
         case .user: return "You"
         case .model: return "Model"
         case .failure: return "Failed"
@@ -197,16 +268,28 @@ public struct ChatView: View {
 
     private var composer: some View {
         HStack(spacing: 8) {
-            TextField("Ask the on-device model…", text: $draft, axis: .vertical)
+            TextField("Ask… e.g. \"Thanksgiving dessert for 10, easy to make\"", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
                 .focused($composerFocused)
                 .onSubmit(send)
-            Button("Send", action: send)
-                .keyboardShortcut(.return, modifiers: .command)
+            // ⌘↩ is macOS-only. On iOS a key-command button whose enabled
+            // state changes re-registers its key commands, and that resigns
+            // the text field's first responder — so the field takes one
+            // character, the button enables, and the keyboard drops.
+            sendButton
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isSending)
         }
         .padding(12)
+    }
+
+    private var sendButton: some View {
+        #if os(macOS)
+        Button("Send", action: send)
+            .keyboardShortcut(.return, modifiers: .command)
+        #else
+        Button("Send", action: send)
+        #endif
     }
 
     private func send() {

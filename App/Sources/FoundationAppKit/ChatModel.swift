@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import FoundationCore
 
-/// Drives one conversation against the on-device model.
+/// Drives one conversation against a chosen Apple Foundation Model.
 ///
 /// Talks to `InferenceService` in process. There is no HTTP here: the server in
 /// this repo exists to reach the model from things that are not Swift, and an
@@ -24,14 +24,23 @@ public final class ChatModel {
         public let kind: Kind
         public let text: String
         public let at: Date
+        /// The model that answered; nil for the user's own messages.
+        public let model: ModelChoice?
         /// Set when this failure was the context window filling up, so the view
         /// can offer the restart rather than making the reader work it out.
         public let exhaustion: ContextExhaustion?
 
-        public init(kind: Kind, text: String, at: Date = Date(), exhaustion: ContextExhaustion? = nil) {
+        public init(
+            kind: Kind,
+            text: String,
+            at: Date = Date(),
+            model: ModelChoice? = nil,
+            exhaustion: ContextExhaustion? = nil
+        ) {
             self.kind = kind
             self.text = text
             self.at = at
+            self.model = model
             self.exhaustion = exhaustion
         }
     }
@@ -47,6 +56,7 @@ public final class ChatModel {
     public struct RetiredSession: Identifiable, Sendable {
         public let id = UUID()
         public let sessionId: String
+        public let model: ModelChoice
         /// Kept so a past run stays interpretable — the same prompts under
         /// different instructions are different experiments.
         public let instructions: String?
@@ -57,35 +67,72 @@ public final class ChatModel {
 
     private let service: InferenceService
 
-    /// The system prompt a fresh launch starts with. It demonstrates the task
-    /// this model is good at — turning prose into a fixed schema — and works
-    /// on the first message.
+    /// The system prompt a fresh launch starts with. A role, not a format: the
+    /// output shape is the schema's job, and the same message reads well in
+    /// both modes — Text gives a chatty shopping list, JSON gives the fields.
     ///
-    /// The "explicitly says" rule keeps qualifiers out of "dislikes": with the
-    /// rule, "likes eggs, but only scrambled" yields `{"likes":["scrambled
-    /// eggs"]}`; without it, "eggs" lands in the dislikes. The plain key names
-    /// are deliberate — this model reads "dislikes" literally and
-    /// "negative_attribute" loosely.
+    /// The second sentence is what turns "pumpkin" into "1 can (15 oz) pure
+    /// pumpkin puree" — a list you can shop from. Measured on the device model:
+    /// "Thanksgiving dessert for 10, easy to make" yields a pumpkin pie with
+    /// eight quantified ingredients, `servings: 10`, `vegetarian: true`.
     public static let defaultInstructions = """
-        You extract what the user likes and dislikes. Answer only in JSON: \
-        {"likes":[...],"dislikes":[...]}. Only put an item in "dislikes" if the \
-        user explicitly says they don't like it; use [] when empty.
+        You are a kitchen helper. The user tells you what they want to cook and \
+        for whom; you work out what they need. Be specific about ingredients: \
+        give quantities, the form (fresh, canned, frozen, dried), and details \
+        that matter such as unsweetened, low-fat, or gluten-free.
         """
 
+    /// The model the live session runs on. A session is bound to its model
+    /// when it is created, so changing this retires the conversation the same
+    /// way changing the system prompt does.
+    public var selectedModel: ModelChoice = .onDevice
     public private(set) var sessionId: String?
     /// Edited freely; only reaches the model when applied. A session fixes its
     /// instructions at construction, so applying necessarily starts a new one —
     /// the UI says so rather than hiding it.
     public var instructionsDraft: String = ChatModel.defaultInstructions
     public private(set) var appliedInstructions: String? = ChatModel.defaultInstructions
+
+    /// The fields the seeded system prompt fills in — one of each type, so
+    /// the editor's grammar is demonstrated by example. Descriptions are the
+    /// model's guide for each field.
+    public static let defaultSchemaText = """
+        dish: string  the dish being made
+        servings: integer  how many people it feeds
+        ingredients: string[]  one item each, with quantity and form
+        vegetarian: bool  true when nothing in it is meat or fish
+        """
+
+    /// When on, every message is answered as a JSON object shaped by
+    /// `schemaText` — guided generation, so the structure is guaranteed. When
+    /// off, the model answers in prose and the schema is ignored. Per message,
+    /// not per session: switching does not restart anything.
+    public var structuredOutput = true
+    public var schemaText: String = ChatModel.defaultSchemaText
+
+    /// Why `schemaText` cannot be used as written, or nil when it can.
+    public var schemaProblem: String? { SchemaEditor.problem(in: schemaText) }
+
+    /// The field names, for a one-line summary when the editor is collapsed.
+    public var schemaSummary: String {
+        (try? OutputSchema.parse(schemaText))?.fields.map(\.name).joined(separator: ", ") ?? "invalid"
+    }
+
     public private(set) var messages: [Message] = []
     public private(set) var retired: [RetiredSession] = []
     public private(set) var usage: ContextUsage?
-    public private(set) var status: StatusResponse?
+    public private(set) var status: [ModelChoice: StatusResponse] = [:]
     public private(set) var isSending = false
 
     public init(service: InferenceService = InferenceService()) {
         self.service = service
+    }
+
+    /// The models that can answer right now. A model counts as available
+    /// until it is known not to be: status arrives a moment after launch, and
+    /// an empty list in the meantime would flicker.
+    public var availableModels: [ModelChoice] {
+        ModelChoice.allCases.filter { status[$0]?.available ?? true }
     }
 
     /// Number of turns sent in this session — the fallback signal when the model
@@ -100,11 +147,24 @@ public final class ChatModel {
     }
 
     public func start() async {
-        status = await service.status()
+        for model in ModelChoice.allCases {
+            status[model] = await service.status(model: model)
+        }
+        if !availableModels.contains(selectedModel) {
+            selectedModel = availableModels.first ?? .onDevice
+        }
         if sessionId == nil {
-            sessionId = await service.createSession(instructions: appliedInstructions)
+            sessionId = await service.createSession(instructions: appliedInstructions, model: selectedModel)
             await refreshUsage()
         }
+    }
+
+    /// Called when `selectedModel` changes. The session is bound to the model
+    /// it was created on, so a new model means a new session; the old
+    /// conversation is retired, not lost.
+    public func modelChanged() async {
+        guard let sessionId, await service.model(for: sessionId) != selectedModel else { return }
+        await newSession(instructions: appliedInstructions, reason: "Model changed")
     }
 
     /// Puts the drafted instructions in force. Retires the current conversation,
@@ -131,20 +191,24 @@ public final class ChatModel {
         messages.append(Message(kind: .user, text: prompt))
 
         do {
-            let response = try await service.generateResponse(for: prompt, sessionId: sessionId)
-            messages.append(Message(kind: .model, text: response.response))
+            let schema = structuredOutput ? try OutputSchema.parse(schemaText) : nil
+            let response = try await service.generateResponse(
+                for: prompt, sessionId: sessionId, schema: schema
+            )
+            messages.append(Message(kind: .model, text: response.response, model: selectedModel))
         } catch let error as InferenceError {
             if case .contextSizeExceeded(let used, let limit) = error {
                 messages.append(Message(
                     kind: .failure,
                     text: error.reason,
+                    model: selectedModel,
                     exhaustion: ContextExhaustion(used: used, limit: limit)
                 ))
             } else {
-                messages.append(Message(kind: .failure, text: error.reason))
+                messages.append(Message(kind: .failure, text: error.reason, model: selectedModel))
             }
         } catch {
-            messages.append(Message(kind: .failure, text: "\(error)"))
+            messages.append(Message(kind: .failure, text: "\(error)", model: selectedModel))
         }
         await refreshUsage()
     }
@@ -161,6 +225,7 @@ public final class ChatModel {
             retired.insert(
                 RetiredSession(
                     sessionId: sessionId,
+                    model: await service.model(for: sessionId) ?? selectedModel,
                     instructions: appliedInstructions,
                     messages: messages,
                     endedAt: Date(),
@@ -175,16 +240,29 @@ public final class ChatModel {
         messages = []
         appliedInstructions = instructions
         instructionsDraft = instructions ?? ""
-        self.sessionId = await service.createSession(instructions: instructions)
+        self.sessionId = await service.createSession(instructions: instructions, model: selectedModel)
         await refreshUsage()
+    }
+
+    public func refreshUsage() async {
+        guard let sessionId else { return }
+        usage = try? await service.contextUsage(sessionId: sessionId)
     }
 
     /// The current session as plain text. Model and system prompt lead, so
     /// the transcript carries what is needed to reproduce it.
     public var transcriptText: String {
         var lines: [String] = []
-        lines.append("Model: \(status?.variant ?? "unknown")")
+        lines.append("Model: \(status[selectedModel]?.variant ?? selectedModel.displayName)")
         lines.append("System prompt: \(appliedInstructions ?? "none")")
+        if structuredOutput {
+            lines.append("Output: JSON")
+            for line in schemaText.split(separator: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                lines.append("  \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        } else {
+            lines.append("Output: text")
+        }
         lines.append("")
         for message in messages {
             let who: String
@@ -197,10 +275,5 @@ public final class ChatModel {
             lines.append("")
         }
         return lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
-    }
-
-    public func refreshUsage() async {
-        guard let sessionId else { return }
-        usage = try? await service.contextUsage(sessionId: sessionId)
     }
 }

@@ -45,6 +45,8 @@ struct App {
                     reset: request.reset ?? false,
                     images: request.images ?? [],
                     instructions: request.instructions,
+                    model: request.model,
+                    schema: request.schema,
                     metadata: request.metadata
                 )
             }
@@ -59,6 +61,8 @@ struct App {
                     instructions: request.instructions,
                     samples: request.samples ?? 3,
                     choices: request.choices,
+                    schema: request.schema,
+                    model: request.model ?? .onDevice,
                     metadata: request.metadata
                 )
             }
@@ -72,11 +76,13 @@ struct App {
             app.post("sessions") { req async -> CreateSessionResponse in
                 // The body is optional: `POST /sessions` with nothing at all is
                 // still the way to get a plain session.
-                let instructions = (try? req.content.decode(CreateSessionRequest.self))?.instructions
-                let id = await inferenceService.createSession(instructions: instructions)
+                let body = try? req.content.decode(CreateSessionRequest.self)
+                let model = body?.model ?? .onDevice
+                let id = await inferenceService.createSession(instructions: body?.instructions, model: model)
                 return CreateSessionResponse(
                     sessionId: id,
-                    instructions: await inferenceService.instructions(for: id)
+                    instructions: await inferenceService.instructions(for: id),
+                    model: model
                 )
             }
 
@@ -115,9 +121,21 @@ struct App {
                 ["status": "ok"]
             }
 
-            // Model status endpoint
-            app.get("status") { _ async -> StatusResponse in
-                await inferenceService.status()
+            // Model status. `?model=private_cloud` asks about the cloud model;
+            // the default describes the on-device one.
+            app.get("status") { req async throws -> StatusResponse in
+                let model: ModelChoice
+                if let raw = req.query[String.self, at: "model"] {
+                    guard let parsed = ModelChoice(rawValue: raw) else {
+                        throw InferenceError.invalidRequest(
+                            "model must be one of \(ModelChoice.allCases.map(\.rawValue).joined(separator: ", "))"
+                        )
+                    }
+                    model = parsed
+                } else {
+                    model = .onDevice
+                }
+                return await inferenceService.status(model: model)
             }
 
             app.logger.info("Server starting on http://localhost:8080")

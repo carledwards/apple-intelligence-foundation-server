@@ -21,15 +21,20 @@ public final class SampleModel {
         case freeText = "Free text"
         case yesNo = "Yes / No"
         case choices = "Choices"
+        /// A JSON object with caller-defined fields, by guided generation.
+        /// Agreement compares whole objects.
+        case json = "JSON"
         public var id: String { rawValue }
     }
 
     public struct Run: Identifiable, Sendable {
         public let id = UUID()
+        public let model: ModelChoice
         public let prompt: String
         public let instructions: String?
         public let imageName: String?
         public let choices: [String]?
+        public let schema: OutputSchema?
         /// Region of the original that was sent, in pixels, or nil for the whole
         /// frame. Recorded because "same question, tighter crop" is the entire
         /// experiment — a run is not interpretable without knowing what was sent.
@@ -38,47 +43,6 @@ public final class SampleModel {
         public let sentHeight: Int?
         public let result: SampleRun
         public let at: Date
-    }
-
-    /// One variable, swept across several values, everything else held fixed.
-    ///
-    /// Doing this by hand means changing a control and pressing Run repeatedly,
-    /// which is how a confounded comparison happens: it is far too easy to change
-    /// the crop and the resolution and then attribute the result to one of them.
-    public enum SweepAxis: String, CaseIterable, Identifiable, Sendable {
-        case resolution = "Resolution"
-        case prompts = "Prompts"
-        public var id: String { rawValue }
-    }
-
-    public struct Sweep: Identifiable, Sendable {
-        public struct Step: Identifiable, Sendable {
-            public let id = UUID()
-            /// What was varied for this step — "384px", or the prompt text.
-            public let label: String
-            public let sentWidth: Int?
-            public let sentHeight: Int?
-            public let result: SampleRun
-        }
-        public let id = UUID()
-        public let axis: SweepAxis
-        /// Everything held constant, for the record.
-        public let held: String
-        public let steps: [Step]
-        public let at: Date
-    }
-
-    /// Runs and sweeps interleaved, newest first, so the results read in the
-    /// order the work actually happened.
-    public enum Entry: Identifiable, Sendable {
-        case run(Run)
-        case sweep(Sweep)
-        public var id: UUID {
-            switch self {
-            case .run(let r): return r.id
-            case .sweep(let s): return s.id
-            }
-        }
     }
 
     private let service: InferenceService
@@ -95,45 +59,54 @@ public final class SampleModel {
     public static let dimensionChoices = [256, 384, 512, 768, 1024, 1536, 2048]
     /// Comma-separated, used when `shape` is `.choices`.
     public var choicesText: String = ""
+    /// One field per line, used when `shape` is `.json`. Seeded with the
+    /// question an image is most often asked.
+    public var schemaText: String = "subjects: string[]  every distinct thing visible in the image"
+
+    /// Why `schemaText` cannot be used as written, or nil when it can.
+    public var schemaProblem: String? { SchemaEditor.problem(in: schemaText) }
+
+    /// The schema in force, or nil unless the shape is JSON and it parses.
+    public var resolvedSchema: OutputSchema? {
+        guard shape == .json else { return nil }
+        return try? OutputSchema.parse(schemaText)
+    }
 
     public private(set) var image: LoadedImage?
     public private(set) var imageName: String?
     /// Selected region in normalized 0–1 coordinates, or nil for the whole frame.
     public var selection: CGRect?
-    public private(set) var entries: [Entry] = []
-    public var sweepAxis: SweepAxis = .resolution
-    /// One prompt variant per line. This is the complete list a prompt sweep
-    /// runs — the single `prompt` above is not implicitly included, because a
-    /// list you can read in full is easier to trust than one with a hidden
-    /// first element.
-    public var promptVariants: String = ""
-
-    /// Called when the sweep axis changes. Seeds the variant list from the
-    /// current prompt so switching to a prompt sweep never silently discards
-    /// what was already typed.
-    public func prepareSweep(for axis: SweepAxis) {
-        guard axis == .prompts else { return }
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard promptVariants.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !trimmed.isEmpty else { return }
-        promptVariants = trimmed + "\n"
-    }
-    public private(set) var progress: String?
-    private var cancelled = false
-
-    /// Resolutions a sweep will try, capped to what the source can supply —
-    /// nothing here upscales, so a larger value would just repeat the native run.
-    public static let sweepDimensions = [64, 128, 256, 384, 512, 768, 1024]
+    /// Newest first, so the results read in the order the work happened.
+    public private(set) var runs: [Run] = []
     public private(set) var isRunning = false
     public private(set) var failure: String?
-    public private(set) var status: StatusResponse?
+    /// The model every run is sent to. Each sample is its own session, so
+    /// switching takes effect on the next run with nothing to retire.
+    public var selectedModel: ModelChoice = .onDevice
+    public private(set) var status: [ModelChoice: StatusResponse] = [:]
 
     public init(service: InferenceService = InferenceService()) {
         self.service = service
     }
 
     public func start() async {
-        status = await service.status()
+        for model in ModelChoice.allCases {
+            status[model] = await service.status(model: model)
+        }
+        if !availableModels.contains(selectedModel) {
+            selectedModel = availableModels.first ?? .onDevice
+        }
+    }
+
+    /// The models that can answer right now. A model counts as available
+    /// until it is known not to be, so the menu does not flicker at launch.
+    public var availableModels: [ModelChoice] {
+        ModelChoice.allCases.filter { status[$0]?.available ?? true }
+    }
+
+    /// The variant name, e.g. "AFM 3 Core Advanced", for labelling results.
+    public func name(of model: ModelChoice) -> String {
+        status[model]?.variant ?? model.displayName
     }
 
     /// Every result on screen as plain text, oldest first, so it reads as a log.
@@ -141,51 +114,39 @@ public final class SampleModel {
     /// resolution — alongside its numbers; a number without its conditions is
     /// not a result.
     public var resultsText: String {
-        var lines: [String] = ["Model: \(status?.variant ?? "unknown")", ""]
-        for entry in entries.reversed() {
-            switch entry {
-            case .run(let run):
-                lines.append("Prompt: \(run.prompt)")
-                if let instructions = run.instructions {
-                    lines.append("System prompt: \(instructions)")
+        var lines: [String] = []
+        for run in runs.reversed() {
+            lines.append("Model: \(name(of: run.model))")
+            lines.append("Prompt: \(run.prompt)")
+            if let instructions = run.instructions {
+                lines.append("System prompt: \(instructions)")
+            }
+            if let w = run.sentWidth, let h = run.sentHeight {
+                let what = run.cropPixels.map { "crop \(Int($0.width))×\(Int($0.height))" } ?? "whole frame"
+                lines.append("Image: \(run.imageName ?? "image") · \(what) → sent \(w)×\(h)")
+            }
+            if let choices = run.choices {
+                lines.append("Choices: \(choices.joined(separator: " · "))")
+            }
+            if let schema = run.schema {
+                lines.append("Schema:")
+                for line in schema.text.split(separator: "\n") {
+                    lines.append("  \(line)")
                 }
-                if let w = run.sentWidth, let h = run.sentHeight {
-                    let what = run.cropPixels.map { "crop \(Int($0.width))×\(Int($0.height))" } ?? "whole frame"
-                    lines.append("Image: \(run.imageName ?? "image") · \(what) → sent \(w)×\(h)")
-                }
-                if let choices = run.choices {
-                    lines.append("Choices: \(choices.joined(separator: " · "))")
-                }
-                lines.append("Samples: \(run.result.sampleCount) · \(run.result.durationMs) ms")
-                for answer in run.result.answers {
-                    lines.append(Self.answerLine(answer, of: run.result.sampleCount))
-                }
-            case .sweep(let sweep):
-                lines.append("Sweep: \(sweep.axis.rawValue) · held fixed — \(sweep.held)")
-                for step in sweep.steps {
-                    var label = step.label
-                    if sweep.axis == .resolution, let w = step.sentWidth, let h = step.sentHeight {
-                        label += " (\(w)×\(h))"
-                    }
-                    lines.append("  \(label)")
-                    for answer in step.result.answers {
-                        lines.append("  " + Self.answerLine(answer, of: step.result.sampleCount))
-                    }
-                }
+            }
+            lines.append("Samples: \(run.result.sampleCount) · \(run.result.durationMs) ms")
+            for answer in run.result.answers {
+                lines.append("  \(answer.count)/\(run.result.sampleCount)  \(String(format: "%.2f", answer.agreement))  \(answer.text)")
             }
             lines.append("")
         }
         return lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
     }
 
-    private static func answerLine(_ answer: SampledAnswer, of total: Int) -> String {
-        "  \(answer.count)/\(total)  \(String(format: "%.2f", answer.agreement))  \(answer.text)"
-    }
-
-    /// The closed answer set in force, or nil for free text.
+    /// The closed answer set in force, or nil for free text and JSON.
     public var resolvedChoices: [String]? {
         switch shape {
-        case .freeText:
+        case .freeText, .json:
             return nil
         case .yesNo:
             return ["yes", "no"]
@@ -201,9 +162,10 @@ public final class SampleModel {
     public var canRun: Bool {
         guard !isRunning,
               !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        // Choices mode needs a usable set, otherwise Run would silently fall
-        // back to free text and quietly change what is being measured.
+        // Choices needs a usable set and JSON a usable schema, otherwise Run
+        // would silently fall back to free text and change what is measured.
         if shape == .choices, resolvedChoices == nil { return false }
+        if shape == .json, resolvedSchema == nil { return false }
         return true
     }
 
@@ -265,25 +227,30 @@ public final class SampleModel {
         let trimmedInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             let choices = resolvedChoices
+            let schema = resolvedSchema
             let sending = resolvedImage()
             let result = try await service.sample(
                 prompt: prompt,
                 images: sending.map { [$0.imageInput] } ?? [],
                 instructions: trimmedInstructions.isEmpty ? nil : trimmedInstructions,
                 samples: samples,
-                choices: choices
+                choices: choices,
+                schema: schema,
+                model: selectedModel
             )
-            entries.insert(.run(Run(
+            runs.insert(Run(
+                    model: selectedModel,
                     prompt: prompt,
                     instructions: trimmedInstructions.isEmpty ? nil : trimmedInstructions,
                     imageName: imageName,
                     choices: choices,
+                    schema: schema,
                     cropPixels: selection.flatMap { sel in image.map { $0.pixelRect(for: sel) } },
                     sentWidth: sending?.sentWidth,
                     sentHeight: sending?.sentHeight,
                     result: result,
                     at: Date()
-                )),
+                ),
                 at: 0
             )
         } catch let error as InferenceError {
@@ -293,110 +260,7 @@ public final class SampleModel {
         }
     }
 
-    public func removeEntry(_ id: UUID) {
-        entries.removeAll { $0.id == id }
-    }
-
-    public func cancel() { cancelled = true }
-
-    // MARK: Sweeps
-
-    /// The values this sweep will step through, given the current state.
-    public var sweepSteps: [String] {
-        switch sweepAxis {
-        case .resolution:
-            guard let native = resolvedImageAtNativeSize() else { return [] }
-            let longest = max(native.sentWidth, native.sentHeight)
-            // Drop any ladder value close to the source's own size. A 257px crop
-            // would otherwise be tested at 256 and 257 — one pixel apart, two
-            // rows, the same experiment run twice.
-            var dims = Self.sweepDimensions.filter {
-                $0 < longest && Double(longest - $0) / Double(longest) >= 0.08
-            }
-            dims.append(longest)
-            return dims.map { "\($0)px" }
-        case .prompts:
-            return promptVariants
-                .split(separator: "\n")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-        }
-    }
-
-    /// The crop (or whole frame) at full available resolution, which sets the
-    /// ceiling for a resolution sweep.
-    private func resolvedImageAtNativeSize() -> LoadedImage? {
-        guard let image else { return nil }
-        let uncapped = max(image.originalWidth, image.originalHeight)
-        guard let selection else { return try? image.resized(maxDimension: uncapped) }
-        return try? image.cropped(to: selection, maxDimension: uncapped)
-    }
-
-    public var canSweep: Bool {
-        guard !isRunning, sweepSteps.count >= 2 else { return false }
-        if sweepAxis == .resolution,
-           prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        if shape == .choices, resolvedChoices == nil { return false }
-        return true
-    }
-
-    public func sweep() async {
-        guard canSweep else { return }
-        isRunning = true
-        cancelled = false
-        failure = nil
-        defer { isRunning = false; progress = nil }
-
-        let axis = sweepAxis
-        let labels = sweepSteps
-        let trimmedInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        let choices = resolvedChoices
-        // Snapshot the controls a sweep does not vary, so restoring them after is
-        // exact and the card can state what was actually held fixed.
-        let savedDimension = maxDimension
-        let savedPrompt = prompt
-        var steps: [Sweep.Step] = []
-
-        for (index, label) in labels.enumerated() {
-            if cancelled { break }
-            progress = "\(index + 1) of \(labels.count) — \(label)"
-
-            switch axis {
-            case .resolution:
-                maxDimension = Int(label.replacingOccurrences(of: "px", with: "")) ?? savedDimension
-            case .prompts:
-                prompt = label
-            }
-
-            guard let sending = resolvedImage() else { continue }
-            do {
-                let result = try await service.sample(
-                    prompt: prompt,
-                    images: [sending.imageInput],
-                    instructions: trimmedInstructions.isEmpty ? nil : trimmedInstructions,
-                    samples: samples,
-                    choices: choices
-                )
-                steps.append(Sweep.Step(label: label,
-                                        sentWidth: sending.sentWidth,
-                                        sentHeight: sending.sentHeight,
-                                        result: result))
-            } catch let error as InferenceError {
-                failure = error.reason
-                break
-            } catch {
-                failure = "\(error)"
-                break
-            }
-        }
-
-        maxDimension = savedDimension
-        prompt = savedPrompt
-
-        guard !steps.isEmpty else { return }
-        let held = axis == .resolution
-            ? "prompt: \(savedPrompt)"
-            : "sent at \(steps.first?.sentWidth ?? 0)×\(steps.first?.sentHeight ?? 0)"
-        entries.insert(.sweep(Sweep(axis: axis, held: held, steps: steps, at: Date())), at: 0)
+    public func removeRun(_ id: UUID) {
+        runs.removeAll { $0.id == id }
     }
 }

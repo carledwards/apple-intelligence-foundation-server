@@ -21,6 +21,7 @@ public struct ImagePane: View {
     @State private var committedPan: CGSize = .zero
     @State private var mode: Mode = .select
     @State private var dragStart: CGPoint?
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     public init(image: LoadedImage, selection: Binding<CGRect?>) {
         self.image = image
@@ -219,7 +220,10 @@ public struct ImagePane: View {
             .font(.caption)
 
             if selection != nil {
-                Button("Clear selection") { selection = nil }.font(.caption)
+                // The short label is for phone width, where the full one
+                // pushes the row past the screen edge.
+                Button(sizeClass == .compact ? "Clear" : "Clear selection") { selection = nil }
+                    .font(.caption)
             }
         }
     }

@@ -1,3 +1,4 @@
+#if os(macOS)
 import SwiftUI
 import AppKit
 import FoundationAppKit
@@ -31,3 +32,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 }
+#else
+// This target is the Mac shell only. The package also declares iOS so that
+// FoundationAppKit can be compiled for it, and an all-targets build for an iOS
+// destination reaches this file too. An executable target needs an entry
+// point on every platform it is compiled for; this one does nothing.
+@main
+struct FoundationAppMac {
+    static func main() {}
+}
+#endif

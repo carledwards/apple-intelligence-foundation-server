@@ -50,6 +50,12 @@ apple-intelligence-foundation-server/
 │   └── Sources/
 │       ├── FoundationAppKit/       #   views and models, builds for macOS + iOS
 │       └── FoundationAppMac/       #   runnable macOS shell
+├── iOS/
+│   ├── FoundationAppiOS.xcodeproj  # iOS app target; links ../App's FoundationAppKit
+│   └── FoundationAppiOS/           #   entry point + entitlements, nothing else
+├── macOS/
+│   ├── FoundationAppMacOS.xcodeproj # bundled, signed Mac app; same shape as iOS
+│   └── FoundationAppMacOS/
 ├── scripts/
 │   ├── ask-image.sh                # Send an image + prompt from the shell
 │   └── classify.sh                 # Batch-classify images; tune your label set
@@ -103,10 +109,18 @@ A SwiftUI client that talks to the model **in process** — no HTTP, no server
 required. It links `FoundationCore` directly, which is the whole reason `Core`
 carries no dependencies.
 
-It carries a live context meter, an editable **Instructions** field for the
-system channel, and a restart that retires the current conversation rather than
-deleting it — so the run that hit a wall stays readable, along with the
-instructions that were steering it.
+It carries a **Model** menu listing whichever Apple Foundation Models are
+available on the machine (changing it starts a new session), a live context
+meter, an editable **System prompt**, an **Output** switch between prose and
+a JSON object whose fields you define (guided generation — see
+[`schema`](#structured-output--schema)), and a restart that
+retires the current conversation rather than deleting it — so the run that hit
+a wall stays readable, along with the prompt that was steering it. It launches
+pre-seeded as a kitchen helper with a four-field schema (`dish`, `servings`,
+`ingredients`, `vegetarian`), so the first message you type — "Thanksgiving
+dessert for 10, easy to make" — gets a structured answer with a shoppable
+ingredient list ("1 can (15 oz) pure pumpkin puree"), and flipping Output to
+Text shows the same model answering the same message in prose.
 
 ```bash
 swift run --package-path App FoundationAppMac
@@ -122,21 +136,32 @@ the server:
 open AppleIntelligenceFoundation.xcworkspace
 ```
 
-Schemes: `FoundationAppMac` (run the app), `FoundationServer` (run the server),
-plus `FoundationCore` and `FoundationAppKit` for building the libraries alone.
-Pick `FoundationAppMac` / My Mac and Run. Breakpoints and the debugger work
-normally, and `ContextMeter` carries a `#Preview` covering its states — including
-the unmeasurable one — so the meter can be tuned without driving a real session
+Schemes: `FoundationAppMacOS` (the Mac app), `FoundationAppiOS` (iPhone or
+iPad simulator), `FoundationAppMac` (the bare SwiftPM Mac binary, on-device
+model only), `FoundationServer` (the server), plus `FoundationCore` and
+`FoundationAppKit` for building the libraries alone. Pick a scheme and a
+matching destination and Run. Breakpoints and the debugger work normally, and
+`ContextMeter` carries a `#Preview` covering its states — including the
+unmeasurable one — so the meter can be tuned without driving a real session
 into each condition.
 
-Xcode resolves the `../Core` path dependency to the copy already in the
-workspace, so there is no duplicate-package conflict.
+Xcode resolves the `../Core` and `../App` path dependencies to the copies
+already in the workspace, so there is no duplicate-package conflict.
 
-`FoundationAppKit` holds every view and builds for iOS as well as macOS, so an
-iOS app target added later links it and supplies only an entry point. The macOS
-executable here is a plain SwiftPM binary rather than a bundled `.app`; that is
-enough to exercise the UI, and a real Xcode app target can come later without
-moving any code.
+`FoundationAppKit` holds every view and builds for iOS as well as macOS. Each
+shell supplies only an entry point:
+
+- `FoundationAppMacOS` and `FoundationAppiOS` are Xcode projects: one file
+  each, linking `FoundationAppKit` from `../App`, signed with the team in
+  `DEVELOPMENT_TEAM`, and carrying the `com.apple.developer.private-cloud-compute`
+  entitlement so Private Cloud Compute is reachable. iOS needs an Xcode project
+  regardless — the simulator and devices run only `.app` bundles.
+- `FoundationAppMac` is a plain SwiftPM executable rather than a bundled
+  `.app`: `swift run --package-path App FoundationAppMac` with no Xcode
+  project involved. A bare binary carries no entitlements, so it reaches the
+  on-device model only. It compiles for iOS as an empty stub, so a
+  whole-workspace build for an iOS destination succeeds; running that stub
+  exits immediately with code 0.
 
 #### Two things a SwiftPM executable needs that a bundled app gets for free
 
@@ -220,7 +245,14 @@ curl -X POST http://localhost:8080/inference \
   "reset": false,
   "images": [
     { "data": "<base64-encoded image bytes>", "label": "optional name" }
-  ]
+  ],
+  "instructions": "optional system prompt, new sessions and one-shots only",
+  "model": "on_device | private_cloud — default on_device, fixed per session",
+  "schema": {
+    "fields": [
+      { "name": "likes", "type": "string[]", "description": "things the user says they like" }
+    ]
+  }
 }
 ```
 
@@ -253,7 +285,7 @@ If the model is not available, you will receive an error response describing the
 `new_session` saves a round trip: it replaces `POST /sessions` followed by
 `POST /inference`, and hands back the id in the same response.
 
-#### Instructions — the system channel
+#### Instructions — the system prompt
 
 `instructions` is a separate channel from the prompt. It is set once, applies to
 every turn in the session, and is charged to the context budget once rather than
@@ -293,6 +325,122 @@ constructed:
 Whether a given piece of framing works better as instructions or inside the
 prompt is not obvious and is worth measuring — see
 [Phrasing Changes the Answer](#phrasing-changes-the-answer--test-before-you-trust).
+
+#### Choosing a model — `model`
+
+Two Apple Foundation Models are reachable: `on_device` (the default) and
+`private_cloud`, the larger model on Apple's Private Cloud Compute. Nothing
+falls back from one to the other; every request runs on the model it named,
+or fails.
+
+```bash
+curl -s -X POST http://localhost:8080/inference \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Summarize the plot of Hamlet in two sentences.","model":"private_cloud"}'
+```
+
+`model` follows the same rule as `instructions`: it is fixed when a session is
+created. Pass it with `new_session`, on a one-shot, or to `POST /sessions`; a
+different value sent with an existing `session_id` is `400`, not a silent
+switch. `GET /status?model=private_cloud` reports the cloud model's window
+and capabilities, and `/sessions/{id}/context` on a cloud session reports the
+window with `used: null` — the cloud model has no token counter.
+
+What the cloud model reports on this machine, next to the on-device one:
+
+| | `on_device` | `private_cloud` |
+|---|---|---|
+| `context_size` | 8192 | 32768 |
+| `supports_vision` | true | true |
+| `supports_guided_generation` | true | true |
+| `supports_reasoning` | false | true |
+
+Two things are different about the cloud model in practice. It has a usage
+quota — exhausting it is `429` with the framework's message naming the reset
+window. And it requires the **`com.apple.developer.private-cloud-compute`
+entitlement**. Without it, `availability` still reports `available` — it
+describes the service, not the caller — and then: a bare binary such as this
+server gets `LanguageModelError -1` wrapping `ModelManagerError 1046` on
+every request, and a signed app **traps** inside the framework with
+`Fatal error: Missing entitlement: com.apple.developer.private-cloud-compute`.
+It is not a thrown error the app can catch.
+
+The entitlement is a managed capability: Apple assigns it to a developer
+account on request, at <https://developer.apple.com/contact/request/private-cloud-compute/>,
+for accounts enrolled in the App Store Small Business Program with fewer than
+two million first-time downloads. Until it is assigned, it does not appear on
+any App ID and no profile can carry it. Where that leaves each target, measured
+on macOS 27.0 / Xcode 27.0:
+
+- **iOS simulator: works.** `iOS/FoundationAppiOS/FoundationAppiOS.entitlements`
+  carries the key, the simulator embeds it without consulting the developer
+  portal, and the cloud model answers. A convenience for testing, not a sign
+  the account is eligible.
+- **Mac, and iOS devices: wait on the account.** Automatic signing reports
+  *"Entitlement com.apple.developer.private-cloud-compute not found and could
+  not be included in profile"*, and an entitlement that cannot go in the
+  profile fails the build. So `macOS/FoundationAppMacOS/FoundationAppMacOS.entitlements`
+  carries the key only as a comment, to be restored once the entitlement is
+  assigned to the account.
+
+Because a signed app that asks without the entitlement traps, the process
+checks its own code signature before offering the cloud model: on macOS
+`ProcessEntitlements` reads the entitlement with `SecTaskCopyValueForEntitlement`,
+and without it `/status?model=private_cloud` reports `available: false` with a
+message naming the entitlement, a `private_cloud` request is `503`, and the
+app's model menu never lists it. That covers the SwiftPM executables too — this
+server and `FoundationAppMac` are plain binaries with no entitlements. iOS has
+no public API for the check; there an installed app is taken to have what its
+profile allowed. The on-device model needs no entitlement.
+
+#### Structured output — `schema`
+
+`schema` makes the response a JSON object with exactly the fields you list,
+produced by guided generation: the framework builds the structure and the model
+supplies only the values. It never emits a brace or a quote.
+
+```bash
+curl -s -X POST http://localhost:8080/inference \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The user likes eggs, but only scrambled, and cannot stand cilantro.",
+    "instructions": "You extract what the user likes and dislikes.",
+    "schema": {"fields": [
+      {"name": "likes",    "type": "string[]", "description": "things the user says they like"},
+      {"name": "dislikes", "type": "string[]", "description": "things the user explicitly says they do not like"}
+    ]}
+  }'
+# {"response":"{\"likes\":[\"scrambled eggs\"],\"dislikes\":[\"cilantro\"]}"}
+```
+
+Each field has a `name`, a `type`, and an optional `description`. A type is
+`string`, `number`, `integer`, or `bool`, followed by any number of array
+suffixes: `[]` for a list, `[N]` for a list of exactly N. Suffixes nest
+innermost-first, so `integer[4][]` is a list of four-integer lists — the
+shape of bounding boxes:
+
+```json
+{"name": "boxes", "type": "integer[4][]",
+ "description": "one box per animal as x, y, width, height in pixels of the sent image"}
+```
+
+The framework enforces the structure, including the exact count. It does
+not make the model good at localisation: the on-device model describes what
+it sees and will fill a box schema with plausible-looking numbers, so treat
+coordinates from it as a hypothesis to check, not a detection. The
+description is the model's guide for that field: it is the one place the
+field's meaning is explained, so a rule such as "only if the user explicitly
+says so" belongs there as much as in `instructions`.
+
+`schema` is per request, not per session. The same session can answer in
+prose on one turn and structured on the next. `response` is still a string;
+parse it as JSON.
+
+Use this rather than asking for JSON in the prompt. Prompted JSON is assembled
+token by token, and this model sometimes puts a reserved control token where a
+quote belongs — it decodes as the literal text `<ctrl46>`, in otherwise
+correct output, intermittently. A schema removes the quote from the model's
+job entirely.
 
 Requests sharing a session must be **sequential**. A second request that arrives
 while the first is still generating gets `409 Conflict`, because the underlying
@@ -413,6 +561,27 @@ curl -X POST http://localhost:8080/sample \
        "images":[{"data":"<base64>"}]}'
 ```
 
+`model` (`on_device` or `private_cloud`) picks which model is sampled; every
+sample runs on that one.
+
+`schema` — the same object as on [`/inference`](#structured-output--schema) —
+makes every sample a JSON object with those fields, and agreement then
+compares whole objects: it measures whether the model is consistent about the
+*values*, not the wording. Exclusive with `choices`. Structured responses —
+here and on `/inference` — come back with their keys sorted, so two objects
+with the same values are the same string regardless of the order the model
+produced the fields in. The order of items inside a list is the model's and
+is not normalized: the same things listed in a different order are different
+answers.
+
+```bash
+curl -X POST http://localhost:8080/sample \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"What is in this image?","samples":5,
+       "schema":{"fields":[{"name":"subjects","type":"string[]","description":"every distinct thing visible"}]},
+       "images":[{"data":"<base64>"}]}'
+```
+
 ```json
 {
   "answers": [
@@ -429,7 +598,7 @@ curl -X POST http://localhost:8080/sample \
 |---|---|---|
 | `prompt` | yes | The question. Must not be empty. |
 | `images` | no | Same shape as `/inference`. Text-only prompts are fine. |
-| `instructions` | no | The system channel, applied to every sample. |
+| `instructions` | no | The system prompt, applied to every sample. |
 | `samples` | no | 1–9, default 3. Each runs in its own session so votes stay uncorrelated. |
 | `choices` | no | 2–64 options. Constrains the answer to a closed set, which is what makes agreement mean anything — see below. |
 | `metadata` | no | Recorded in the log, never sent to the model. |
@@ -765,14 +934,17 @@ same reason as above: the framework cannot count an attachment.
 ### GET `/status`
 
 Reports which model is actually serving requests — useful for confirming an OS
-upgrade swapped in a newer on-device model.
+upgrade swapped in a newer on-device model. `?model=private_cloud` describes
+the cloud model instead.
 
 ```bash
 curl http://localhost:8080/status
+curl "http://localhost:8080/status?model=private_cloud"
 ```
 
 ```json
 {
+  "model": "on_device",
   "available": true,
   "message": "Model is available",
   "variant": "AFM 3 Core Advanced",
@@ -783,7 +955,8 @@ curl http://localhost:8080/status
 }
 ```
 
-`variant` is the display name of the on-device model variant.
+`variant` is the display name of the on-device model variant. The cloud
+model does not name one; it reports `"Private Cloud Compute"`.
 
 `context_size` is read from the model rather than hardcoded — 8192 on current
 hardware. Read it from the endpoint instead of assuming it.
@@ -1017,9 +1190,10 @@ It cannot be reconstructed later, so log `metadata` from the first event.
 - **Web framework**: [Vapor](https://github.com/vapor/vapor) 4.89.0, in `Server` only
 - **AI integration**: `FoundationModels` framework (Apple's on-device language model)
 - **Architecture**: Async/await with Actor-based inference service for concurrency safety
-- **Model**: `SystemLanguageModel.default` — on device. Private Cloud Compute is
-  deliberately not used; a cloud fallback would mask the local failures this is
-  built to surface.
+- **Models**: `SystemLanguageModel.default` on device, the default everywhere,
+  and `PrivateCloudComputeLanguageModel` when a request names `private_cloud`.
+  There is no automatic fallback between them; a cloud fallback would mask the
+  local failures this is built to surface.
 - **Port**: 8080 (default Vapor HTTP port)
 - **Context window**: reported by `/status` as `context_size` — 8192 tokens on
   current hardware. Don't hardcode it; read the endpoint.

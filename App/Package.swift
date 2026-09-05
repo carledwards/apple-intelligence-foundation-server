@@ -3,11 +3,10 @@ import PackageDescription
 
 // The app.
 //
-// `FoundationAppKit` holds every view and model and builds for macOS *and* iOS,
-// so the UI can be compiled and checked on both platforms without an Xcode
-// project existing yet. `FoundationAppMac` is a thin runnable shell for the Mac.
-// An iOS app target added later links FoundationAppKit and supplies its own
-// entry point — no UI code has to move.
+// `FoundationAppKit` holds every view and model and builds for macOS *and* iOS.
+// `FoundationAppMac` is a thin runnable shell for the Mac with no Xcode project
+// involved. The bundled app targets — `../iOS` and `../macOS` — link
+// FoundationAppKit and supply only an entry point.
 let package = Package(
     name: "FoundationApp",
     platforms: [

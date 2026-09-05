@@ -6,11 +6,14 @@ import CryptoKit
 
 /// The model layer: sessions, image prompting, and closed-set classification.
 ///
-/// Targets macOS 27 / iOS 27 and uses `SystemLanguageModel.default` — the
-/// on-device model only. Private Cloud Compute is deliberately not used, because
-/// a cloud fallback would mask exactly the local failures this is built to find.
+/// Targets macOS 27 / iOS 27. Two models are reachable, `SystemLanguageModel`
+/// on the device and `PrivateCloudComputeLanguageModel` on Apple's servers, and
+/// every request names the one it wants; the default is on-device. Nothing
+/// falls back to the cloud on its own — a silent fallback would mask exactly
+/// the local failures this is built to find.
 public actor InferenceService {
     private let model: SystemLanguageModel
+    private let cloud: PrivateCloudComputeLanguageModel
     private var sessions: [String: LanguageModelSession] = [:]
     private var lastAccessed: [String: Date] = [:]
     /// Sessions with a `respond` call in flight. This actor's isolation is
@@ -22,15 +25,118 @@ public actor InferenceService {
     /// them at construction, so they are kept here to be reapplied when a session
     /// is reset — a reset clears the transcript, not the session's configuration.
     private var sessionInstructions: [String: String] = [:]
+    /// The model each session was created on. Fixed for the session's life.
+    private var sessionModel: [String: ModelChoice] = [:]
     private let log: InferenceLog?
 
     public init(log: InferenceLog? = nil) {
         self.model = SystemLanguageModel.default
+        self.cloud = PrivateCloudComputeLanguageModel()
         self.log = log
     }
 
-    private var variantName: String {
-        model.variant.displayName
+    // MARK: Backends
+
+    /// The two model classes share `LanguageModel` but report availability,
+    /// context size, and variant through different APIs. This is the one place
+    /// that difference is handled.
+    private enum Backend {
+        case onDevice(SystemLanguageModel)
+        case privateCloud(PrivateCloudComputeLanguageModel)
+
+        var isAvailable: Bool {
+            switch self {
+            case .onDevice(let model):
+                if case .available = model.availability { return true }
+                return false
+            case .privateCloud(let model):
+                // The framework reports the service; the entitlement is the
+                // caller's side of the bargain, and without it a request
+                // traps rather than throws.
+                return ProcessEntitlements.hasPrivateCloudCompute && model.isAvailable
+            }
+        }
+
+        var availabilityMessage: String {
+            switch self {
+            case .onDevice(let model):
+                switch model.availability {
+                case .available:
+                    return "Model is available"
+                case .unavailable(.deviceNotEligible):
+                    return "Device is not eligible for Apple Intelligence"
+                case .unavailable(.appleIntelligenceNotEnabled):
+                    return "Apple Intelligence is not enabled in Settings"
+                case .unavailable(.modelNotReady):
+                    return "Model is downloading or not ready yet"
+                case .unavailable:
+                    return "Model is unavailable for unknown reason"
+                @unknown default:
+                    return "Model availability unknown"
+                }
+            case .privateCloud(let model):
+                guard ProcessEntitlements.hasPrivateCloudCompute else {
+                    return "Private Cloud Compute requires the \(ProcessEntitlements.privateCloudComputeKey) entitlement, which this process does not have"
+                }
+                switch model.availability {
+                case .available:
+                    return "Private Cloud Compute is available"
+                case .unavailable(.deviceNotEligible):
+                    return "Device is not eligible for Private Cloud Compute"
+                case .unavailable(.systemNotReady):
+                    return "Private Cloud Compute is not ready"
+                case .unavailable:
+                    return "Private Cloud Compute is unavailable for unknown reason"
+                @unknown default:
+                    return "Private Cloud Compute availability unknown"
+                }
+            }
+        }
+
+        var capabilities: LanguageModelCapabilities {
+            switch self {
+            case .onDevice(let model): return model.capabilities
+            case .privateCloud(let model): return model.capabilities
+            }
+        }
+
+        /// The on-device variant name, or the service name for the cloud,
+        /// which does not disclose one.
+        var variantName: String {
+            switch self {
+            case .onDevice(let model): return model.variant.displayName
+            case .privateCloud: return "Private Cloud Compute"
+            }
+        }
+
+        /// The cloud reports its window over the network, so this is async.
+        /// Zero when the cloud cannot be asked.
+        func contextSize() async -> Int {
+            switch self {
+            case .onDevice(let model): return model.contextSize
+            case .privateCloud(let model): return (try? await model.contextSize) ?? 0
+            }
+        }
+
+        /// Instructions are the model's system channel: set once, applied to
+        /// every turn, and charged to the context budget once.
+        func makeSession(instructions: String?) -> LanguageModelSession {
+            switch self {
+            case .onDevice(let model):
+                guard let instructions, !instructions.isEmpty else { return LanguageModelSession(model: model) }
+                return LanguageModelSession(model: model, instructions: instructions)
+            case .privateCloud(let model):
+                guard let instructions, !instructions.isEmpty else { return LanguageModelSession(model: model) }
+                return LanguageModelSession(model: model, instructions: instructions)
+            }
+        }
+    }
+
+    private func backend(_ choice: ModelChoice) -> Backend {
+        switch choice {
+        case .onDevice: return .onDevice(model)
+        case .privateCloud: return .privateCloud(cloud)
+        }
     }
 
     /// Records one request. `status` is the status the caller saw, so failures
@@ -45,6 +151,7 @@ public actor InferenceService {
         images: [ImageDigest],
         started: Date,
         metadata: JSONValue?,
+        model: ModelChoice = .onDevice,
         status: Int,
         error: String? = nil
     ) async {
@@ -59,73 +166,51 @@ public actor InferenceService {
             classes: classes,
             images: images,
             durationMs: Int(Date().timeIntervalSince(started) * 1000),
-            modelVariant: variantName,
+            modelVariant: backend(model).variantName,
             metadata: metadata,
             status: status,
             error: error
         ))
     }
 
-    public func checkAvailability() -> Bool {
-        switch model.availability {
-        case .available:
-            return true
-        default:
-            return false
-        }
+    public func checkAvailability(model: ModelChoice = .onDevice) -> Bool {
+        backend(model).isAvailable
     }
 
-    /// Describes the model actually backing this process — variant, context
+    /// Describes one of the models backing this process — variant, context
     /// budget, and which capabilities it reports.
-    public func status() -> StatusResponse {
-        StatusResponse(
-            available: checkAvailability(),
-            message: getAvailabilityMessage(),
-            variant: model.variant.displayName,
-            contextSize: model.contextSize,
-            supportsVision: model.capabilities.contains(.vision),
-            supportsGuidedGeneration: model.capabilities.contains(.guidedGeneration),
-            supportsReasoning: model.capabilities.contains(.reasoning)
+    public func status(model choice: ModelChoice = .onDevice) async -> StatusResponse {
+        let backend = backend(choice)
+        return StatusResponse(
+            model: choice,
+            available: backend.isAvailable,
+            message: backend.availabilityMessage,
+            variant: backend.variantName,
+            contextSize: await backend.contextSize(),
+            supportsVision: backend.capabilities.contains(.vision),
+            supportsGuidedGeneration: backend.capabilities.contains(.guidedGeneration),
+            supportsReasoning: backend.capabilities.contains(.reasoning)
         )
     }
 
-    public func getAvailabilityMessage() -> String {
-        switch model.availability {
-        case .available:
-            return "Model is available"
-        case .unavailable(.deviceNotEligible):
-            return "Device is not eligible for Apple Intelligence"
-        case .unavailable(.appleIntelligenceNotEnabled):
-            return "Apple Intelligence is not enabled in Settings"
-        case .unavailable(.modelNotReady):
-            return "Model is downloading or not ready yet"
-        case .unavailable:
-            return "Model is unavailable for unknown reason"
-        @unknown default:
-            return "Model availability unknown"
-        }
+    public func getAvailabilityMessage(model: ModelChoice = .onDevice) -> String {
+        backend(model).availabilityMessage
     }
 
-    /// Instructions are the model's system channel: set once, applied to every
-    /// turn, and charged to the context budget once rather than per prompt.
-    private static func newSession(instructions: String?) -> LanguageModelSession {
-        guard let instructions, !instructions.isEmpty else { return LanguageModelSession() }
-        return LanguageModelSession(instructions: instructions)
-    }
-
-    private func makeSession(instructions: String?) -> (id: String, session: LanguageModelSession) {
+    private func makeSession(instructions: String?, model: ModelChoice) -> (id: String, session: LanguageModelSession) {
         let id = UUID().uuidString
-        let session = Self.newSession(instructions: instructions)
+        let session = backend(model).makeSession(instructions: instructions)
         sessions[id] = session
         lastAccessed[id] = Date()
+        sessionModel[id] = model
         if let instructions, !instructions.isEmpty {
             sessionInstructions[id] = instructions
         }
         return (id, session)
     }
 
-    public func createSession(instructions: String? = nil) -> String {
-        makeSession(instructions: instructions).id
+    public func createSession(instructions: String? = nil, model: ModelChoice = .onDevice) -> String {
+        makeSession(instructions: instructions, model: model).id
     }
 
     /// What a session was created with, so a UI can show the system channel
@@ -134,19 +219,23 @@ public actor InferenceService {
         sessionInstructions[sessionId]
     }
 
+    /// The model a session runs on, or nil for an unknown session.
+    public func model(for sessionId: String) -> ModelChoice? {
+        sessionModel[sessionId]
+    }
+
     public func deleteSession(_ id: String) {
         sessions.removeValue(forKey: id)
         lastAccessed.removeValue(forKey: id)
         sessionInstructions.removeValue(forKey: id)
+        sessionModel.removeValue(forKey: id)
     }
 
     public func cleanupStaleSessions() {
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
         let staleIds = lastAccessed.filter { $0.value < cutoff }.map { $0.key }
         for id in staleIds {
-            sessions.removeValue(forKey: id)
-            lastAccessed.removeValue(forKey: id)
-            sessionInstructions.removeValue(forKey: id)
+            deleteSession(id)
         }
     }
 
@@ -160,6 +249,14 @@ public actor InferenceService {
     public func contextUsage(sessionId: String) async throws -> ContextUsage {
         guard let session = sessions[sessionId] else {
             throw InferenceError.sessionNotFound(sessionId)
+        }
+        // The cloud model has no token counter; its window is the only number.
+        if sessionModel[sessionId] == .privateCloud {
+            return ContextUsage(
+                used: nil,
+                limit: await backend(.privateCloud).contextSize(),
+                note: "Token counting is not available for Private Cloud Compute sessions"
+            )
         }
         do {
             let used = try await model.tokenCount(for: session.transcript)
@@ -198,14 +295,19 @@ public actor InferenceService {
         reset: Bool = false,
         images: [ImageInput] = [],
         instructions: String? = nil,
+        model: ModelChoice? = nil,
+        schema: OutputSchema? = nil,
         metadata: JSONValue? = nil
     ) async throws -> InferenceResponse {
         let started = Date()
         var digests: [ImageDigest] = []
+        // A continuing session answers on the model it was created with.
+        let resolvedModel = sessionId.flatMap { sessionModel[$0] } ?? model ?? .onDevice
         do {
             let response = try await runInference(
                 prompt: prompt, sessionId: sessionId, newSession: newSession,
-                reset: reset, images: images, instructions: instructions, digests: &digests
+                reset: reset, images: images, instructions: instructions,
+                model: model, resolvedModel: resolvedModel, schema: schema, digests: &digests
             )
             // Resolve from the session so a continuing turn logs the instructions
             // already in force, not just the ones passed on this call.
@@ -213,14 +315,14 @@ public actor InferenceService {
             await record(endpoint: "/inference", sessionId: response.sessionId,
                          instructions: inForce, prompt: prompt,
                          response: response.response, images: digests, started: started,
-                         metadata: metadata, status: 200)
+                         metadata: metadata, model: resolvedModel, status: 200)
             return response
         } catch {
             await record(endpoint: "/inference", sessionId: sessionId,
                          instructions: sessionId.flatMap { sessionInstructions[$0] } ?? instructions,
                          prompt: prompt,
                          response: nil, images: digests, started: started,
-                         metadata: metadata, status: Self.status(of: error),
+                         metadata: metadata, model: resolvedModel, status: Self.status(of: error),
                          error: Self.reason(of: error))
             throw error
         }
@@ -233,10 +335,24 @@ public actor InferenceService {
         reset: Bool,
         images: [ImageInput],
         instructions: String?,
+        model requestedModel: ModelChoice?,
+        resolvedModel: ModelChoice,
+        schema: OutputSchema?,
         digests: inout [ImageDigest]
     ) async throws -> InferenceResponse {
-        guard checkAvailability() else {
-            throw InferenceError.modelUnavailable(getAvailabilityMessage())
+        let backend = backend(resolvedModel)
+        guard backend.isAvailable else {
+            throw InferenceError.modelUnavailable(backend.availabilityMessage)
+        }
+        // Checked before any session is created, so a bad schema cannot leave a
+        // new persisted session behind.
+        let generation = try schema?.generationSchema()
+        // A session's model is fixed at creation, like its instructions. A
+        // request naming a different one is refused, not silently redirected.
+        if let requestedModel, let sessionId, let bound = sessionModel[sessionId], bound != requestedModel {
+            throw InferenceError.invalidRequest(
+                "Session \(sessionId) runs on \(bound.rawValue); model cannot be changed on an existing session. Start a new one"
+            )
         }
         guard !(newSession && sessionId != nil) else {
             throw InferenceError.invalidRequest("Pass either session_id or new_session, not both. To clear an existing session, use reset")
@@ -270,7 +386,7 @@ public actor InferenceService {
                 // the transcript, and the context budget it consumed, are dropped.
                 // The instructions it was created with are reapplied: a reset
                 // clears the conversation, not the session's configuration.
-                let fresh = Self.newSession(instructions: sessionInstructions[sessionId])
+                let fresh = backend.makeSession(instructions: sessionInstructions[sessionId])
                 sessions[sessionId] = fresh
                 session = fresh
             } else {
@@ -279,53 +395,63 @@ public actor InferenceService {
             lastAccessed[sessionId] = Date()
             resolvedSessionId = sessionId
         } else if newSession {
-            let created = makeSession(instructions: instructions)
+            let created = makeSession(instructions: instructions, model: resolvedModel)
             session = created.session
             resolvedSessionId = created.id
         } else {
             // One-shot request: the session is discarded once the response returns.
-            session = Self.newSession(instructions: instructions)
+            session = backend.makeSession(instructions: instructions)
             resolvedSessionId = nil
         }
 
         // A one-shot request owns its session outright, so only shared sessions
         // need marking. `defer` releases the mark on the error paths too.
         guard let busyId = resolvedSessionId else {
-            let content = try await respond(in: session, to: prompt, images: images, digests: &digests)
+            let content = try await respond(
+                in: session, on: backend, to: prompt, images: images, schema: generation, digests: &digests
+            )
             return InferenceResponse(response: content, sessionId: nil)
         }
         busySessions.insert(busyId)
         defer { busySessions.remove(busyId) }
-        let content = try await respond(in: session, to: prompt, images: images, digests: &digests)
+        let content = try await respond(
+            in: session, on: backend, to: prompt, images: images, schema: generation, digests: &digests
+        )
         return InferenceResponse(response: content, sessionId: busyId)
     }
 
+    /// With a schema, the answer is the generated object as JSON text. The
+    /// framework built the structure, so it is well-formed by construction.
     private func respond(
         in session: LanguageModelSession,
+        on backend: Backend,
         to prompt: String,
         images: [ImageInput],
+        schema: GenerationSchema?,
         digests: inout [ImageDigest]
     ) async throws -> String {
-        guard !images.isEmpty else {
-            do {
-                return try await session.respond(to: prompt).content
-            } catch {
-                throw Self.translate(error)
+        var attachments: [Attachment<ImageAttachmentContent>] = []
+        if !images.isEmpty {
+            guard backend.capabilities.contains(.vision) else {
+                throw InferenceError.visionUnsupported
             }
+            // Attachments carry a label so the prompt can refer to a specific
+            // image when several are sent together.
+            let decoded = try images.enumerated().map { index, image in
+                (result: try Self.decodeImage(image, at: index), label: image.label ?? "image \(index + 1)")
+            }
+            digests = decoded.map(\.result.digest)
+            attachments = decoded.map { Attachment($0.result.image).label($0.label) }
         }
-        guard model.capabilities.contains(.vision) else {
-            throw InferenceError.visionUnsupported
-        }
-
-        // Attachments carry a label so the prompt can refer to a specific image
-        // when several are sent together.
-        let decoded = try images.enumerated().map { index, image in
-            (result: try Self.decodeImage(image, at: index), label: image.label ?? "image \(index + 1)")
-        }
-        digests = decoded.map(\.result.digest)
-        let attachments = decoded.map { Attachment($0.result.image).label($0.label) }
 
         do {
+            if let schema {
+                let result = try await session.respond(schema: schema) {
+                    prompt
+                    attachments
+                }
+                return OutputSchema.canonicalJSON(result.content.jsonString)
+            }
             let response = try await session.respond {
                 prompt
                 attachments
@@ -352,6 +478,8 @@ public actor InferenceService {
         instructions: String? = nil,
         samples: Int = 3,
         choices: [String]? = nil,
+        schema: OutputSchema? = nil,
+        model: ModelChoice = .onDevice,
         metadata: JSONValue? = nil
     ) async throws -> SampleRun {
         let started = Date()
@@ -359,18 +487,19 @@ public actor InferenceService {
         do {
             let run = try await runSamples(
                 prompt: prompt, images: images, instructions: instructions,
-                samples: samples, choices: choices, started: started, digests: &digests
+                samples: samples, choices: choices, schema: schema, model: model,
+                started: started, digests: &digests
             )
             await record(endpoint: "/sample", sessionId: nil, instructions: instructions,
                          prompt: prompt,
                          response: run.answers.map { "\($0.text) (\($0.count)/\(run.sampleCount))" }
                              .joined(separator: " | "),
-                         images: digests, started: started, metadata: metadata, status: 200)
+                         images: digests, started: started, metadata: metadata, model: model, status: 200)
             return run
         } catch {
             await record(endpoint: "/sample", sessionId: nil, instructions: instructions,
                          prompt: prompt, response: nil, images: digests, started: started,
-                         metadata: metadata, status: Self.status(of: error),
+                         metadata: metadata, model: model, status: Self.status(of: error),
                          error: Self.reason(of: error))
             throw error
         }
@@ -382,12 +511,19 @@ public actor InferenceService {
         instructions: String?,
         samples: Int,
         choices: [String]?,
+        schema: OutputSchema?,
+        model: ModelChoice,
         started: Date,
         digests: inout [ImageDigest]
     ) async throws -> SampleRun {
-        guard checkAvailability() else {
-            throw InferenceError.modelUnavailable(getAvailabilityMessage())
+        let backend = backend(model)
+        guard backend.isAvailable else {
+            throw InferenceError.modelUnavailable(backend.availabilityMessage)
         }
+        guard choices == nil || schema == nil else {
+            throw InferenceError.invalidRequest("Pass either choices or schema, not both")
+        }
+        let generation = try schema?.generationSchema()
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw InferenceError.invalidRequest("prompt must not be empty")
         }
@@ -409,7 +545,7 @@ public actor InferenceService {
             }
         }
         if !images.isEmpty {
-            guard model.capabilities.contains(.vision) else {
+            guard backend.capabilities.contains(.vision) else {
                 throw InferenceError.visionUnsupported
             }
         }
@@ -423,17 +559,20 @@ public actor InferenceService {
 
         var responses: [String] = []
         for _ in 0..<samples {
-            let session = Self.newSession(instructions: instructions)
+            let session = backend.makeSession(instructions: instructions)
             var perRun: [ImageDigest] = []
             if let schema {
                 responses.append(
                     try await respondWithChoices(
-                        in: session, to: prompt, images: images, schema: schema, digests: &perRun
+                        in: session, on: backend, to: prompt, images: images, schema: schema, digests: &perRun
                     )
                 )
             } else {
+                // With a schema each sample is the generated object as JSON;
+                // agreement then compares whole objects, so it measures whether
+                // the model is consistent about the values, not the wording.
                 responses.append(
-                    try await respond(in: session, to: prompt, images: images, digests: &perRun)
+                    try await respond(in: session, on: backend, to: prompt, images: images, schema: generation, digests: &perRun)
                 )
             }
             // Identical every round; recorded once rather than N times.
@@ -497,6 +636,7 @@ public actor InferenceService {
 
     private func respondWithChoices(
         in session: LanguageModelSession,
+        on backend: Backend,
         to prompt: String,
         images: [ImageInput],
         schema: GenerationSchema,
@@ -506,7 +646,7 @@ public actor InferenceService {
         if images.isEmpty {
             attachments = []
         } else {
-            guard model.capabilities.contains(.vision) else {
+            guard backend.capabilities.contains(.vision) else {
                 throw InferenceError.visionUnsupported
             }
             let decoded = try images.enumerated().map { index, image in
@@ -536,20 +676,23 @@ public actor InferenceService {
             await record(endpoint: "/classify", sessionId: nil, prompt: request.hint,
                          response: response.subjects.map(\.label).joined(separator: ","),
                          classes: request.classes, images: digests,
-                         started: started, metadata: request.metadata, status: 200)
+                         started: started, metadata: request.metadata,
+                         model: request.model ?? .onDevice, status: 200)
             return response
         } catch {
             await record(endpoint: "/classify", sessionId: nil, prompt: request.hint,
                          response: nil, classes: request.classes, images: digests,
                          started: started, metadata: request.metadata,
+                         model: request.model ?? .onDevice,
                          status: Self.status(of: error), error: Self.reason(of: error))
             throw error
         }
     }
 
     private func runClassify(_ request: ClassifyRequest, started: Date, digests: inout [ImageDigest]) async throws -> ClassifyResponse {
-        guard checkAvailability() else {
-            throw InferenceError.modelUnavailable(getAvailabilityMessage())
+        let backend = backend(request.model ?? .onDevice)
+        guard backend.isAvailable else {
+            throw InferenceError.modelUnavailable(backend.availabilityMessage)
         }
         guard request.classes.count >= 2 else {
             throw InferenceError.invalidRequest("classes must contain at least 2 labels")
@@ -574,7 +717,7 @@ public actor InferenceService {
         guard (1...10).contains(maxLabels) else {
             throw InferenceError.invalidRequest("max_labels must be between 1 and 10")
         }
-        guard model.capabilities.contains(.vision) else {
+        guard backend.capabilities.contains(.vision) else {
             throw InferenceError.visionUnsupported
         }
 
@@ -616,7 +759,7 @@ public actor InferenceService {
         // Each sample is an independent session so votes stay uncorrelated.
         var rounds: [[String]] = []
         for _ in 0..<samples {
-            let session = LanguageModelSession(model: model)
+            let session = backend.makeSession(instructions: nil)
             let result: LanguageModelSession.Response<GeneratedContent>
             do {
                 result = try await session.respond(schema: schema) {
@@ -670,6 +813,21 @@ public actor InferenceService {
     /// matters: it carries real numbers, and a caller that only sees a string has
     /// no way to show how far over the budget it went.
     private static func translate(_ error: Error) -> Error {
+        if isMissingCloudEntitlement(error) {
+            return InferenceError.modelUnavailable(
+                "Private Cloud Compute refused this process (ModelManagerError 1046). It requires the com.apple.developer.private-cloud-compute entitlement, which a SwiftPM executable cannot carry; run the Xcode-built app"
+            )
+        }
+        if let cloudError = error as? PrivateCloudComputeLanguageModel.Error {
+            switch cloudError {
+            case .quotaLimitReached:
+                return InferenceError.quotaExceeded(cloudError.localizedDescription)
+            case .networkFailure, .serviceUnavailable:
+                return InferenceError.modelUnavailable(cloudError.localizedDescription)
+            @unknown default:
+                return error
+            }
+        }
         guard let modelError = error as? LanguageModelError else { return error }
         switch modelError {
         case .contextSizeExceeded(let info):
@@ -683,6 +841,21 @@ public actor InferenceService {
         default:
             return error
         }
+    }
+
+    /// `ModelManagerError 1046`, nested under a generic `LanguageModelError`,
+    /// is the cloud model's answer to a process without the
+    /// `com.apple.developer.private-cloud-compute` entitlement. Measured: a
+    /// signed app missing it traps with that entitlement named; the same
+    /// build with it answers; an unsigned binary gets this error instead.
+    private static func isMissingCloudEntitlement(_ error: Error) -> Bool {
+        func walk(_ error: NSError) -> Bool {
+            if error.domain == "ModelManagerServices.ModelManagerError", error.code == 1046 { return true }
+            let nested = (error.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError]) ?? []
+            let underlying = (error.userInfo[NSUnderlyingErrorKey] as? NSError).map { [$0] } ?? []
+            return (nested + underlying).contains(where: walk)
+        }
+        return walk(error as NSError)
     }
 
     private static func status(of error: Error) -> Int {

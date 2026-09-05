@@ -1,6 +1,8 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+#else
+import PhotosUI
 #endif
 import UniformTypeIdentifiers
 import FoundationCore
@@ -8,6 +10,12 @@ import FoundationCore
 public struct SampleView: View {
     @State private var model = SampleModel()
     @State private var picking = false
+    #if !os(macOS)
+    @State private var photoItem: PhotosPickerItem?
+    #endif
+    // Phone-width layouts stack what the Mac fits in one row.
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    private var compact: Bool { sizeClass == .compact }
     @State private var requestedPaneHeight: CGFloat = 260
     @State private var committedPaneHeight: CGFloat = 260
     @State private var dragging = false
@@ -15,54 +23,86 @@ public struct SampleView: View {
     public init() {}
 
     public var body: some View {
-        @Bindable var model = model
-        // The image and its controls are an instrument panel: they stay put while
-        // results accumulate below. Scrolling the whole workbench also let the
-        // image slide up beneath the floating tab bar, which no amount of
-        // clipping inside the pane can prevent — the pane itself was moving.
-        return GeometryReader { outer in
-            VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 14) {
-                    imageWell(maxHeight: outer.size.height)
-                    if let failure = model.failure {
-                        Label(failure, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                    controls
-                }
-                .padding(14)
-
-                Divider()
-
+        // On a wide window the image and its controls are an instrument panel:
+        // they stay put while results accumulate below. On a phone that panel
+        // is taller than the screen, so the whole workbench scrolls as one.
+        GeometryReader { outer in
+            if compact {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
-                        if model.entries.isEmpty {
-                            hint
-                        } else {
-                            HStack {
-                                Text("Results")
-                                    .font(.caption.weight(.semibold))
-                                Spacer()
-                                CopyButton(help: "Copy all results as text") { model.resultsText }
-                            }
-                            ForEach(model.entries) { entry in
-                                switch entry {
-                                case .run(let run): runCard(run)
-                                case .sweep(let sweep): sweepCard(sweep)
-                                }
-                            }
-                        }
+                        panel(maxHeight: outer.size.height)
+                        Divider()
+                        results
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(14)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    panel(maxHeight: outer.size.height)
+                        .padding(14)
+                    Divider()
+                    ScrollView {
+                        results
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                    }
                 }
             }
         }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image]) { result in
             if case .success(let url) = result { model.load(url: url) }
         }
+        #if !os(macOS)
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    model.load(data: data, name: "photo")
+                }
+                photoItem = nil
+            }
+        }
+        #endif
         .task { await model.start() }
+    }
+
+    /// The image, its controls, and the inputs — everything above the results.
+    private func panel(maxHeight: CGFloat) -> some View {
+        @Bindable var model = model
+        return VStack(alignment: .leading, spacing: 14) {
+            ModelMenu(
+                selection: $model.selectedModel,
+                models: model.availableModels,
+                status: model.status,
+                disabled: model.isRunning
+            )
+            imageWell(maxHeight: maxHeight)
+            if let failure = model.failure {
+                Label(failure, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            controls
+        }
+    }
+
+    private var results: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if model.runs.isEmpty {
+                hint
+            } else {
+                HStack {
+                    Text("Results")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    CopyButton(help: "Copy all results as text") { model.resultsText }
+                }
+                ForEach(model.runs) { run in
+                    runCard(run)
+                }
+            }
+        }
     }
 
     /// Never let the panel eat the whole window: results have to stay visible or
@@ -83,43 +123,62 @@ public struct SampleView: View {
                     .clipped()
                 resizeHandle
                 HStack(spacing: 8) {
-                    Text(model.imageName ?? "image").font(.caption.weight(.medium))
+                    Text(model.imageName ?? "image")
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Picker("Send at", selection: $model.maxDimension) {
                         ForEach(SampleModel.dimensionChoices, id: \.self) { Text("\($0)px").tag($0) }
                     }
                     .pickerStyle(.menu)
                     .fixedSize()
                     .font(.caption)
-                    // What is actually sent is stated, never implied: downscaling
-                    // and cropping both change the answer.
-                    if let description = model.sendDescription {
-                        Text(description)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(model.selection == nil ? .secondary : Color.accentColor)
-                    }
                     Spacer()
                     Button("Remove") { model.clearImage() }.font(.caption)
                 }
+                // What is actually sent is stated, never implied: downscaling
+                // and cropping both change the answer. Its own line, so it is
+                // never truncated to make room for the controls.
+                if let description = model.sendDescription {
+                    Text(description)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(model.selection == nil ? .secondary : Color.accentColor)
+                }
             } else {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
-                        .foregroundStyle(.secondary.opacity(0.5))
-                    VStack(spacing: 4) {
-                        Image(systemName: "photo.on.rectangle.angled").font(.title2)
-                        Text("Drop an image, or click to choose").font(.caption)
-                    }
-                    .foregroundStyle(.secondary)
-                }
-                .frame(height: 180)
-                .contentShape(Rectangle())
-                .onTapGesture { picking = true }
-                .dropDestination(for: URL.self) { urls, _ in
-                    guard let url = urls.first else { return false }
-                    model.load(url: url)
-                    return true
-                }
+                #if os(macOS)
+                dropWell
+                    .onTapGesture { picking = true }
+                #else
+                // The photo library is where an iPhone's images are; the Files
+                // picker is a poor fit there. Drop still works on iPad.
+                PhotosPicker(selection: $photoItem, matching: .images) { dropWell }
+                    .buttonStyle(.plain)
+                #endif
             }
+        }
+    }
+
+    private var dropWell: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                .foregroundStyle(.secondary.opacity(0.5))
+            VStack(spacing: 4) {
+                Image(systemName: "photo.on.rectangle.angled").font(.title2)
+                #if os(macOS)
+                Text("Drop an image, or click to choose").font(.caption)
+                #else
+                Text("Tap to choose a photo").font(.caption)
+                #endif
+            }
+            .foregroundStyle(.secondary)
+        }
+        .frame(height: 180)
+        .contentShape(Rectangle())
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            model.load(url: url)
+            return true
         }
     }
 
@@ -168,24 +227,22 @@ public struct SampleView: View {
                       text: $model.prompt, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
-                .opacity(model.sweepAxis == .prompts ? 0.55 : 1)
-                .help(model.sweepAxis == .prompts
-                      ? "Used by Run. A prompt sweep uses the variant list instead."
-                      : "The question sent to the model.")
-            HStack(spacing: 10) {
-                Picker("", selection: $model.shape) {
-                    ForEach(SampleModel.AnswerShape.allCases) { Text($0.rawValue).tag($0) }
+            if compact {
+                shapePicker
+                HStack(spacing: 10) {
+                    samplesStepper
+                    Spacer()
+                    if model.isRunning { ProgressView().controlSize(.small) }
+                    runButton
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                Stepper("Samples: \(model.samples)", value: $model.samples, in: 1...9)
-                    .fixedSize()
-                Spacer()
-                if model.isRunning { ProgressView().controlSize(.small) }
-                Button("Run") { Task { await model.run() } }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(!model.canRun)
+            } else {
+                HStack(spacing: 10) {
+                    shapePicker.fixedSize()
+                    samplesStepper.fixedSize()
+                    Spacer()
+                    if model.isRunning { ProgressView().controlSize(.small) }
+                    runButton
+                }
             }
 
             if model.shape == .choices {
@@ -199,50 +256,9 @@ public struct SampleView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                Picker("", selection: $model.sweepAxis) {
-                    ForEach(SampleModel.SweepAxis.allCases) { Text("Sweep \($0.rawValue)").tag($0) }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
-                .onChange(of: model.sweepAxis) { _, axis in
-                    model.prepareSweep(for: axis)
-                }
-                Text(model.sweepSteps.isEmpty ? "no steps" : "\(model.sweepSteps.count) steps × \(model.samples)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let progress = model.progress {
-                    Text(progress).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Button("Cancel") { model.cancel() }.font(.caption)
-                } else {
-                    Button("Sweep") { Task { await model.sweep() } }
-                        .disabled(!model.canSweep)
-                }
-            }
-
-            if model.sweepAxis == .prompts {
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $model.promptVariants)
-                        .font(.callout)
-                        .scrollContentBackground(.hidden)
-                        .padding(4)
-                        .frame(minHeight: 76, maxHeight: 150)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(.secondary.opacity(0.35), lineWidth: 1)
-                        )
-                    if model.promptVariants.isEmpty {
-                        Text("One prompt per line")
-                            .font(.callout)
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 12)
-                            .allowsHitTesting(false)
-                    }
-                }
-                Text("Sweep runs every line here, and only these — the single prompt above is used by Run.")
+            if model.shape == .json {
+                SchemaEditor(text: $model.schemaText, problem: model.schemaProblem)
+                Text("Agreement compares whole objects. Field order is normalized; the order of items inside a list is not, so the same things listed in a different order count as different answers.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -253,6 +269,33 @@ public struct SampleView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var shapePicker: some View {
+        @Bindable var model = model
+        return Picker("", selection: $model.shape) {
+            ForEach(SampleModel.AnswerShape.allCases) { Text($0.rawValue).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private var samplesStepper: some View {
+        @Bindable var model = model
+        return Stepper("Samples: \(model.samples)", value: $model.samples, in: 1...9)
+    }
+
+    /// ⌘↩ is macOS-only: on iOS a key-command button whose enabled state
+    /// changes resigns the focused text field's first responder.
+    private var runButton: some View {
+        #if os(macOS)
+        Button("Run") { Task { await model.run() } }
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(!model.canRun)
+        #else
+        Button("Run") { Task { await model.run() } }
+            .disabled(!model.canRun)
+        #endif
     }
 
     private var hint: some View {
@@ -278,13 +321,20 @@ public struct SampleView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Button {
-                    model.removeEntry(run.id)
+                    model.removeRun(run.id)
                 } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.plain)
             }
 
+            // The device model is the default and goes unsaid; any other
+            // model is named, because that is what changed.
+            if run.model != .onDevice {
+                Label(model.name(of: run.model), systemImage: "cloud")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             if let instructions = run.instructions {
                 Label(instructions, systemImage: "text.badge.checkmark")
                     .font(.caption2)
@@ -304,6 +354,13 @@ public struct SampleView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            if let schema = run.schema {
+                Label(schema.fields.map { "\($0.name): \($0.type)" }.joined(separator: " · "),
+                      systemImage: "curlybraces")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
 
             ForEach(Array(run.result.answers.enumerated()), id: \.offset) { _, answer in
                 HStack(alignment: .top, spacing: 8) {
@@ -315,125 +372,32 @@ public struct SampleView: View {
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .frame(width: 26, alignment: .leading)
-                    Text(answer.text)
+                    AnswerText(text: answer.text)
                         .font(.callout)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
             if run.result.answers.count > 1 {
-                Text(run.choices == nil
-                     ? "\(run.result.answers.count) distinct wordings. Over free text this counts phrasing, not meaning — re-run with a closed answer set to see whether the answers actually differ."
-                     : "Split \(run.result.answers.count) ways — the model gave different answers to the same question.")
+                Text(splitNote(for: run))
                     .font(.caption2)
-                    .foregroundStyle(run.choices == nil ? Color.secondary : Color.orange)
+                    .foregroundStyle(run.choices == nil && run.schema == nil ? Color.secondary : Color.orange)
             }
         }
         .padding(10)
         .background(.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    /// One row per swept value. Reading down the column is the comparison; that
-    /// is the point of running them together rather than one at a time.
-    private func sweepCard(_ sweep: SampleModel.Sweep) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Label("Sweep: \(sweep.axis.rawValue)", systemImage: "slider.horizontal.3")
-                    .font(.callout.weight(.medium))
-                Spacer()
-                Text("\(sweep.steps.count) steps")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Button {
-                    model.removeEntry(sweep.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-            }
-            Text("held fixed — \(sweep.held)")
-                .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-
-            ForEach(Array(sweep.steps.enumerated()), id: \.element.id) { index, step in
-                let previous = index > 0 ? sweep.steps[index - 1].result.answers.first?.text : nil
-                let changed = previous != nil && previous != step.result.answers.first?.text
-                HStack(alignment: .top, spacing: 8) {
-                    // A marker where the top answer flips. Finding that boundary
-                    // is the reason to run a sweep rather than a single sample.
-                    Text(changed ? "▸" : " ")
-                        .font(.caption2)
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 8)
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(step.label)
-                            .font(.caption.monospacedDigit().weight(.medium))
-                            .lineLimit(2)
-                        // The cap is what you set; this is what was actually sent.
-                        if let w = step.sentWidth, let h = step.sentHeight,
-                           sweep.axis == .resolution {
-                            Text("\(w)×\(h)")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .frame(width: sweep.axis == .resolution ? 66 : 170, alignment: .leading)
-
-                    if let top = step.result.answers.first {
-                        Text(String(format: "%.2f", top.agreement))
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(tint(top.agreement))
-                            .frame(width: 34, alignment: .trailing)
-                        Text("\(top.count)/\(step.result.sampleCount)")
-                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                            .frame(width: 26, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(top.text)
-                                .font(.callout)
-                                .fontWeight(changed ? .semibold : .regular)
-                                .textSelection(.enabled)
-                            ForEach(Array(step.result.answers.dropFirst().enumerated()), id: \.offset) { _, other in
-                                HStack(spacing: 4) {
-                                    Text("also")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                    Text("\(other.count)/\(step.result.sampleCount)")
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.tertiary)
-                                    Text(other.text)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-
-            if let boundary = transition(in: sweep) {
-                Text(boundary)
-                    .font(.caption2)
-                    .foregroundStyle(Color.accentColor)
-            }
+    /// What a split means depends on what constrained the answer. Free text
+    /// splits on wording; a closed set or a schema splits on the answer itself.
+    private func splitNote(for run: SampleModel.Run) -> String {
+        let n = run.result.answers.count
+        if run.schema != nil {
+            return "Split \(n) ways — the same fields with different values. Key order is normalized; the order of items inside a list is not."
         }
-        .padding(10)
-        .background(.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    /// Names the boundary when the top answer flips exactly once — the common and
-    /// most readable case. Stays silent when it flips repeatedly, because then
-    /// there is no single boundary to report and saying otherwise would mislead.
-    private func transition(in sweep: SampleModel.Sweep) -> String? {
-        var flips: [(String, String)] = []
-        for index in 1..<max(sweep.steps.count, 1) {
-            let before = sweep.steps[index - 1]
-            let after = sweep.steps[index]
-            if before.result.answers.first?.text != after.result.answers.first?.text {
-                flips.append((before.label, after.label))
-            }
+        if run.choices != nil {
+            return "Split \(n) ways — the model gave different answers to the same question."
         }
-        guard flips.count == 1, let flip = flips.first else { return nil }
-        return "answer changes between \(flip.0) and \(flip.1)"
+        return "\(n) distinct wordings. Over free text this counts phrasing, not meaning — re-run with a closed answer set to see whether the answers actually differ."
     }
 
     private func tint(_ agreement: Double) -> Color {

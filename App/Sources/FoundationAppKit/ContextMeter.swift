@@ -8,10 +8,12 @@ import FoundationCore
 /// it survives before the window fills, because that is the constraint that will
 /// break the app they are actually building.
 public struct ContextMeter: View {
+    let title: String
     let usage: ContextUsage?
     let turns: Int
 
-    public init(usage: ContextUsage?, turns: Int) {
+    public init(title: String = "Context", usage: ContextUsage?, turns: Int) {
+        self.title = title
         self.usage = usage
         self.turns = turns
     }
@@ -29,7 +31,7 @@ public struct ContextMeter: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Context")
+                Text(title)
                     .font(.caption.weight(.semibold))
                 Spacer()
                 if let usage, let used = usage.used {

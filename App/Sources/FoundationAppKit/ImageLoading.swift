@@ -79,8 +79,25 @@ public enum ImageLoading {
     /// answer. This mirrors what `scripts/ask-image.sh` does with `sips`, so a
     /// result seen in the app matches one seen from the shell.
     public static func load(_ data: Data, maxDimension: Int = 1024) throws -> LoadedImage {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let full = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            throw Failure.unreadable
+        }
+        // Decoded through the thumbnail API at full size, because that is the
+        // path that applies the file's EXIF orientation. A plain decode returns
+        // the sensor's pixels as stored, and a photo taken with the phone
+        // rotated comes out on its side or upside down — as displayed, as
+        // cropped, and as sent to the model.
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let width = properties?[kCGImagePropertyPixelWidth] as? Int ?? 0
+        let height = properties?[kCGImagePropertyPixelHeight] as? Int ?? 0
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(width, height, 1),
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let full = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+                ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw Failure.unreadable
         }
         return try make(from: full, maxDimension: maxDimension)
