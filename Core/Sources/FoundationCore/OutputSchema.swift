@@ -131,7 +131,7 @@ public struct OutputSchema: Codable, Sendable, Equatable {
 
     // MARK: Framework schema
 
-    func generationSchema() throws -> GenerationSchema {
+    public func generationSchema() throws -> GenerationSchema {
         try validate()
         let properties = fields.map { field in
             DynamicGenerationSchema.Property(

@@ -67,20 +67,12 @@ public final class ChatModel {
 
     private let service: InferenceService
 
-    /// The system prompt a fresh launch starts with. A role, not a format: the
-    /// output shape is the schema's job, and the same message reads well in
-    /// both modes — Text gives a chatty shopping list, JSON gives the fields.
-    ///
-    /// The second sentence is what turns "pumpkin" into "1 can (15 oz) pure
-    /// pumpkin puree" — a list you can shop from. Measured on the device model:
-    /// "Thanksgiving dessert for 10, easy to make" yields a pumpkin pie with
-    /// eight quantified ingredients, `servings: 10`, `vegetarian: true`.
-    public static let defaultInstructions = """
-        You are a kitchen helper. The user tells you what they want to cook and \
-        for whom; you work out what they need. Be specific about ingredients: \
-        give quantities, the form (fresh, canned, frozen, dried), and details \
-        that matter such as unsweetened, low-fat, or gluten-free.
-        """
+    /// The system prompt a fresh launch starts with: the kitchen helper
+    /// defined in `FoundationCore`, the same text the evaluation target
+    /// measures. Measured on the device model: "Thanksgiving dessert for 10,
+    /// easy to make" yields a pumpkin pie with eight quantified ingredients,
+    /// `servings: 10`, `vegetarian: true`.
+    public static let defaultInstructions = KitchenHelper.instructions
 
     /// The model the live session runs on. A session is bound to its model
     /// when it is created, so changing this retires the conversation the same
@@ -93,15 +85,9 @@ public final class ChatModel {
     public var instructionsDraft: String = ChatModel.defaultInstructions
     public private(set) var appliedInstructions: String? = ChatModel.defaultInstructions
 
-    /// The fields the seeded system prompt fills in — one of each type, so
-    /// the editor's grammar is demonstrated by example. Descriptions are the
-    /// model's guide for each field.
-    public static let defaultSchemaText = """
-        dish: string  the dish being made
-        servings: integer  how many people it feeds
-        ingredients: string[]  one item each, with quantity and form
-        vegetarian: bool  true when nothing in it is meat or fish
-        """
+    /// The fields the seeded system prompt fills in, from the same
+    /// definition as the prompt.
+    public static let defaultSchemaText = KitchenHelper.schemaText
 
     /// When on, every message is answered as a JSON object shaped by
     /// `schemaText` — guided generation, so the structure is guaranteed. When

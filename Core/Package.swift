@@ -15,6 +15,13 @@ let package = Package(
         .library(name: "FoundationCore", targets: ["FoundationCore"])
     ],
     targets: [
-        .target(name: "FoundationCore")
+        .target(name: "FoundationCore"),
+        // Measures the kitchen-helper prompt with Apple's Evaluations
+        // framework. Runs under `swift test` and in Xcode, where the results
+        // appear in the Evaluations test report.
+        .testTarget(
+            name: "FoundationCoreEvaluations",
+            dependencies: ["FoundationCore"]
+        )
     ]
 )

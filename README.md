@@ -34,12 +34,15 @@ macOS 26 have been removed rather than carried forward.
 apple-intelligence-foundation-server/
 ├── Core/                           # FoundationCore — the model layer
 │   ├── Package.swift               #   no dependencies at all
-│   └── Sources/FoundationCore/
-│       ├── InferenceService.swift  #   sessions, image prompting, classification
-│       ├── InferenceError.swift    #   every error this package throws
-│       ├── InferenceLog.swift      #   JSONL request log
-│       ├── Models.swift            #   request/response types
-│       └── JSONValue.swift         #   arbitrary caller metadata
+│   ├── Sources/FoundationCore/
+│   │   ├── InferenceService.swift  #   sessions, image prompting, classification
+│   │   ├── InferenceError.swift    #   every error this package throws
+│   │   ├── InferenceLog.swift      #   JSONL request log
+│   │   ├── Models.swift            #   request/response types
+│   │   ├── OutputSchema.swift      #   caller-defined JSON shape → GenerationSchema
+│   │   ├── KitchenHelper.swift     #   the prompt + schema the app ships and the tests measure
+│   │   └── JSONValue.swift         #   arbitrary caller metadata
+│   └── Tests/FoundationCoreEvaluations/  # Apple Evaluations framework: measures KitchenHelper
 ├── Server/                         # FoundationServer — the HTTP interface
 │   ├── Package.swift               #   depends on ../Core and Vapor
 │   └── Sources/FoundationServer/
@@ -121,7 +124,10 @@ pre-seeded as a kitchen helper with a four-field schema (`dish`, `servings`,
 `ingredients`, `vegetarian`), so the first message you type — "Thanksgiving
 dessert for 10, easy to make" — gets a structured answer with a shoppable
 ingredient list ("1 can (15 oz) pure pumpkin puree"), and flipping Output to
-Text shows the same model answering the same message in prose.
+Text shows the same model answering the same message in prose. That prompt and
+schema are defined once, in `KitchenHelper.swift`, and measured by an
+[evaluation](#evaluating-the-prompt-with-apples-evaluations-framework) — the
+schema wording shipped here is the result of that measurement.
 
 ```bash
 swift run --package-path App FoundationAppMac
@@ -161,8 +167,10 @@ open AppleIntelligenceFoundation.xcworkspace
 
 Schemes: `FoundationAppMacOS` (the Mac app), `FoundationAppiOS` (iPhone or
 iPad simulator), `FoundationAppMac` (the bare SwiftPM Mac binary, on-device
-model only), `FoundationServer` (the server), plus `FoundationCore` and
-`FoundationAppKit` for building the libraries alone. Pick a scheme and a
+model only), `FoundationServer` (the server), `FoundationCoreEvaluations`
+(the prompt evaluation — ⌘U, then the Evaluations tab of the test report; see
+[Evaluating the prompt](#evaluating-the-prompt-with-apples-evaluations-framework)),
+plus `FoundationCore` and `FoundationAppKit` for building the libraries alone. Pick a scheme and a
 matching destination and Run. Breakpoints and the debugger work normally, and
 `ContextMeter` carries a `#Preview` covering its states — including the
 unmeasurable one — so the meter can be tuned without driving a real session
@@ -1122,6 +1130,10 @@ judge built on this model imports exactly the unreliability you are trying to
 measure, and hides it behind a number that looks rigorous. A closed answer set
 costs nothing, is deterministic, and is auditable.
 
+The [evaluation target](#evaluating-the-prompt-with-apples-evaluations-framework)
+uses a model judge anyway — as a source of rationales to read, never as a
+number to gate on.
+
 ---
 
 ### How to actually test a change
@@ -1142,6 +1154,156 @@ costs nothing, is deterministic, and is auditable.
    change moved the number.
 6. **Keep `LOG_FILE` set in production.** Live frames will find failures your test
    set does not, and the log is the only way you will see them.
+
+That is the shell version of the loop. For a feature written in Swift, Apple's
+Evaluations framework does steps 3–5 as a test target — next section.
+
+---
+
+## Evaluating the Prompt with Apple's Evaluations Framework
+
+Apple's [Evaluations framework](https://developer.apple.com/documentation/evaluations)
+(WWDC26, in the 27 SDKs) turns "does this prompt still work" into a test. An
+`Evaluation` is a dataset of samples, a `subject(from:)` that runs the feature
+on one sample, a list of evaluators that each return a `Metric` (pass, fail, or
+a score, with a rationale), and an `aggregateMetrics` step that computes
+statistics over the whole dataset. A Swift Testing `@Test(.evaluates(…))`
+then asserts on the aggregates, so a prompt change that makes the feature
+worse fails the build.
+
+`Core/Tests/FoundationCoreEvaluations` does this for the kitchen helper the
+scratchpad ships with. The scratchpad is still where a prompt gets *found*;
+this is where it gets *kept*.
+
+```bash
+swift test --package-path Core                                  # ~50 s on Apple silicon; one run in seven took four minutes
+KITCHEN_RESULTS=./eval-results swift test --package-path Core   # also write per-sample JSON
+```
+
+In Xcode, pick the `FoundationCoreEvaluations` scheme, ⌘U, then open the test
+report and its **Evaluations** tab: one row per sample with the prompt, the
+answer, every metric, and every rationale. The JSON file written by
+`KITCHEN_RESULTS` carries the same rows (with transcripts), so two runs can be
+diffed outside Xcode.
+
+### What it measures
+
+Twelve asks, written by hand and varied in occasion, size, diet, and how the
+serving count is phrased ("for 10", "for two", "my wife and me"). Each runs in a
+fresh session with the shipped system prompt and schema. Per sample:
+
+| Metric | Kind | Checks |
+|---|---|---|
+| `Servings` | pass/fail | `servings` equals the number asked for |
+| `VegetarianFlag` | pass/fail | `vegetarian` equals the expected flag |
+| `FlagMatchesList` | pass/fail | `vegetarian` agrees with the ingredient list — no expectation needed, both come from the same answer |
+| `NamedIngredients` | pass/fail | words the ask implies ("avocado" for guacamole) appear in the list |
+| `ListLength` | pass/fail | 3–20 ingredients — fewer is not worked out, more is not a shopping list |
+| `Quantified` | score 0–1 | fraction of ingredients carrying a digit or a measure word |
+| `Shoppable`, `FitsTheAsk` | model judge, 1–4 | rubric scored by a language model, with a written rationale |
+
+### What it found
+
+The first two runs scored `Quantified` at 0.74 and 0.71 and `ListLength` at
+0.58 and 0.64, and the per-sample view showed why. Asked for a vegan lunch, the model answered
+`ingredients: ["quinoa", "2 cups", "dried"]` — it read the field's description,
+*one item each, with quantity and form*, as one **fact** per item. Other asks
+came back with a single ingredient ("pumpkin puree – 2 cups, canned" for a
+whole pie). Nothing in the chat window had made either pattern obvious; a
+dozen answers side by side did.
+
+The system prompt was never touched. Two changes to the description of the
+`ingredients` field, measured one at a time:
+
+| `ingredients` description | Quantified | ListLength | Shoppable (judge) |
+|---|---|---|---|
+| one item each, with quantity and form | 0.71 | 0.64 | 3.1 |
+| one ingredient per item, written as quantity, form, and name together, e.g. "2 cups canned pumpkin puree" | 0.98 | 0.67 | 4.0 |
+| every ingredient the dish needs, one per item, written as … (shipped) | 0.94–1.0 | 0.75–1.0 | 3.7–4.0 |
+
+The last row is the spread over four runs of the same text: the model is not
+deterministic, and the metric it moves most between runs is how many
+ingredients it bothers to list. One run in seven also failed a sample outright
+with *transcript exceeded the model's context size* — on a fresh session and a
+seven-word prompt. The only thing in that transcript that can grow is the
+unbounded `string[]`, so this is the model failing to stop a list; it is rare,
+and the report records it as an inference error rather than hiding it in the
+averages.
+
+### Decision points
+
+Each of these is a choice the framework leaves to you. What this project chose,
+and what the alternative would have bought:
+
+1. **Where the evaluation lives.** A test target in `Core`, so `swift test`
+   runs it with no Xcode project and no Vapor, and the same target appears in
+   the workspace with the Xcode report. The prompt and schema moved from the
+   app into `KitchenHelper.swift` in `Core` for this reason: the app and the
+   evaluation must read one definition, or the test measures a copy. The
+   alternative is a test target on the Mac app project, which is what the
+   Xcode template gives you and is the only option if the feature is entangled
+   with UI code.
+
+2. **What the subject calls.** The Foundation Models framework directly — a
+   `LanguageModelSession` with the sample's instructions and a `respond(to:schema:)`
+   — not `InferenceService` and not HTTP. The evaluation is of the prompt and
+   the schema; the service adds nothing the model sees, and calling the
+   framework directly gives the report a transcript. Point the subject at the
+   HTTP API instead if what you want to regression-test is the server.
+
+3. **Partial expectations.** The expected value is the same `Dish` type as the
+   answer, with every field optional: nil means "not checked", and
+   `ingredients` lists words that must appear rather than the whole list,
+   which is the model's to choose. The framework requires expected and actual
+   to share a type; making that type total would mean writing the model's
+   answer down in advance, which is not a test of a generative feature.
+
+4. **Quantitative gates, qualitative reports.** The six code-checked metrics
+   are asserted. The two judge dimensions are aggregated and printed but not
+   asserted. The judge defaults to the on-device model — the model grading its
+   own homework, which the [section above](#dont-use-the-model-to-judge-its-own-output)
+   shows is unreliable as a *comparator*. As a *reader's aid* it earns its
+   place: it scored the birthday cake that ignored the gluten-free child a 2
+   with a rationale saying so, when no code metric had caught it. Apple's
+   guidance is a judge at least as capable as the model under test, meaning
+   Private Cloud Compute: `KITCHEN_JUDGE=private_cloud` switches to it, and
+   `KITCHEN_MODEL=private_cloud` puts it under test instead. Both need the
+   entitlement, which the `swift test` host process does not carry, so on the
+   Mac they fail the same way the bare binary does until the entitlement is
+   granted and the tests run from a signed host.
+
+5. **Thresholds from the spread, not the wish.** Each `#expect` sits one
+   sample (8 points, with twelve samples) below the lowest value seen across
+   four runs. They are tripwires: crossing one means a change made the feature
+   worse on a case the dataset covers. Setting them at the target you would
+   *like* makes the test fail on the model's own variance, and a test that
+   fails on its own is switched off within a week. More samples narrow the
+   step and let the thresholds rise.
+
+6. **A failing sample, kept.** "A vegan lunch for my daughter and her three
+   friends" returns `servings: 5` in every run — the model counts the parent.
+   It stays in the dataset as a recorded weakness the `Servings` threshold
+   accommodates. Deleting it would raise the number and lose the fact; the fix
+   is a prompt change, which this test will measure when it is made.
+
+7. **Twelve hand-written samples.** The framework's `SampleGenerator` can grow
+   a seed set to hundreds synthetically. Twelve cover the axes this prompt
+   has (occasion, party size in digits and in words, diet, one constraint) and
+   run in under a minute, which is the difference between a test that runs on
+   every change and one that runs on Fridays. Generate more when a metric's
+   spread is wider than the effect being measured.
+
+8. **Consistency is measured elsewhere.** The Image tab's "same question three
+   times, agreement counted" has no direct equivalent here; the framework
+   would need each prompt duplicated and a standard deviation aggregated.
+   Run-to-run spread is visible instead by running the suite more than once,
+   which is how the table above was made.
+
+One framework quirk to save a search: the report's transcript column shows an
+empty `instructionText` even though the instructions were applied — the answers
+carry the forms and quantities the prompt asks for, and a session built the
+same way shows the instructions entry in its own `transcript`. The report's
+extraction misses it; the model does not.
 
 ---
 
@@ -1327,6 +1489,8 @@ If you encounter module import errors:
 - [FoundationModels Framework Documentation](https://developer.apple.com/documentation/FoundationModels)
 - [Generating content and performing tasks with Foundation Models](https://developer.apple.com/documentation/foundationmodels/generating-content-and-performing-tasks-with-foundation-models)
 - [Apple Intelligence](https://www.apple.com/apple-intelligence/)
+- [Evaluations framework](https://developer.apple.com/documentation/evaluations) and
+  [Meet the Evaluations framework (WWDC26)](https://developer.apple.com/videos/play/wwdc2026/298/)
 
 ---
 
