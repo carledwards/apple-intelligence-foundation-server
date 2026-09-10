@@ -55,7 +55,7 @@ apple-intelligence-foundation-server/
 │       └── FoundationAppMac/       #   runnable macOS shell
 ├── iOS/
 │   ├── FoundationAppiOS.xcodeproj  # iOS app target; links ../App's FoundationAppKit
-│   └── FoundationAppiOS/           #   entry point + entitlements, nothing else
+│   └── FoundationAppiOS/           #   entry point, entitlements (simulator-only), its Info.plist flag
 ├── macOS/
 │   ├── FoundationAppMacOS.xcodeproj # bundled, signed Mac app; same shape as iOS
 │   └── FoundationAppMacOS/
@@ -184,9 +184,11 @@ shell supplies only an entry point:
 
 - `FoundationAppMacOS` and `FoundationAppiOS` are Xcode projects: one file
   each, linking `FoundationAppKit` from `../App`, signed with the team in
-  `DEVELOPMENT_TEAM`, and carrying the `com.apple.developer.private-cloud-compute`
-  entitlement so Private Cloud Compute is reachable. iOS needs an Xcode project
-  regardless — the simulator and devices run only `.app` bundles.
+  `DEVELOPMENT_TEAM`. The iOS project attaches the
+  `com.apple.developer.private-cloud-compute` entitlement **for simulator
+  builds only**, so a device build installs with an ordinary profile and
+  offers the on-device model alone. iOS needs an Xcode project regardless —
+  the simulator and devices run only `.app` bundles.
 - `FoundationAppMac` is a plain SwiftPM executable rather than a bundled
   `.app`: `swift run --package-path App FoundationAppMac` with no Xcode
   project involved. A bare binary carries no entitlements, so it reaches the
@@ -407,10 +409,16 @@ on macOS 27.0 / Xcode 27.0:
   carries the key, the simulator embeds it without consulting the developer
   portal, and the cloud model answers. A convenience for testing, not a sign
   the account is eligible.
-- **Mac, and iOS devices: wait on the account.** Automatic signing reports
-  *"Entitlement com.apple.developer.private-cloud-compute not found and could
-  not be included in profile"*, and an entitlement that cannot go in the
-  profile fails the build. So `macOS/FoundationAppMacOS/FoundationAppMacOS.entitlements`
+- **iOS devices: on-device model only, and it installs.** The project attaches
+  the entitlements file under a build condition, `[sdk=iphonesimulator*]`, so
+  a device build carries no entitlement and signs with an ordinary profile.
+  The same condition sets an `Info.plist` key, `FoundationPrivateCloudCompute`,
+  which is how the app knows at runtime which flavor it is. Once the account
+  has the entitlement, dropping the condition is the whole change.
+- **Mac: wait on the account.** Automatic signing reports *"Entitlement
+  com.apple.developer.private-cloud-compute not found and could not be
+  included in profile"*, and an entitlement that cannot go in the profile
+  fails the build. So `macOS/FoundationAppMacOS/FoundationAppMacOS.entitlements`
   carries the key only as a comment, to be restored once the entitlement is
   assigned to the account.
 
@@ -421,8 +429,9 @@ and without it `/status?model=private_cloud` reports `available: false` with a
 message naming the entitlement, a `private_cloud` request is `503`, and the
 app's model menu never lists it. That covers the SwiftPM executables too — this
 server and `FoundationAppMac` are plain binaries with no entitlements. iOS has
-no public API for the check; there an installed app is taken to have what its
-profile allowed. The on-device model needs no entitlement.
+no public API for the check, so there the app reads the `Info.plist` key the
+project sets under the same condition as the entitlement: present on the
+simulator, absent on a device. The on-device model needs no entitlement.
 
 #### Structured output — `schema`
 

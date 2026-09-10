@@ -192,7 +192,8 @@
 		F0A0000000000000000001B0 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = FoundationAppiOS/FoundationAppiOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]" = FoundationAppiOS/FoundationAppiOS.entitlements;
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "FoundationAppiOS/PrivateCloudCompute-Info.plist";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = 52XPPRU27K;
 				CURRENT_PROJECT_VERSION = 1;
@@ -221,7 +222,8 @@
 		F0A0000000000000000001B1 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = FoundationAppiOS/FoundationAppiOS.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]" = FoundationAppiOS/FoundationAppiOS.entitlements;
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "FoundationAppiOS/PrivateCloudCompute-Info.plist";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = 52XPPRU27K;
 				CURRENT_PROJECT_VERSION = 1;

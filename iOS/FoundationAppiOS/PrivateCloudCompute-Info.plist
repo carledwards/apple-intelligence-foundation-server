@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged into the generated Info.plist for simulator builds only, under the
+	     same build condition that attaches the entitlements file. The app reads
+	     this key to know it may offer Private Cloud Compute. -->
+	<key>FoundationPrivateCloudCompute</key>
+	<true/>
+</dict>
+</plist>
