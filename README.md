@@ -133,6 +133,29 @@ schema wording shipped here is the result of that measurement.
 swift run --package-path App FoundationAppMac
 ```
 
+The **Photos** tab is the batch version of the Image tab, built for labeling a
+folder of your own photos: add many at once, put one circle on each subject
+(drag to move it, pinch or the slider to tighten it; the circle's bounding
+square is cut from the full-resolution original, and the pane shows the crop's
+pixel size so the 384 px floor is visible), and the model classifies the whole
+frame and the circle against your closed label set — N samples, per-label
+agreement — plus one sentence about each. Apple's Vision framework runs beside
+it on both, animals by name and the scene classifier's top labels with their
+real confidences, so the two can be compared per photo. Moving a circle re-runs
+that photo after a short pause, one photo at a time. "Read text" runs a third pass on a photo:
+Vision reads the words off the full-resolution original and the model, given
+only those words, names the place (with the country when it can be inferred),
+the people, the dates, and the occasion — a signpost says "Zermatt", the model
+says Switzerland. Off by default and available per photo, since most photos
+have no text and the few that do are the interesting ones. "Send at" is a set of
+checkable sizes: one is the normal run, several is a resolution sweep with a
+verdict kept per size and a by-size table in the summary. Check the rows you
+want and Export writes one folder: `labels.csv` (file, kinds, notes, crop) in
+the format the Looking Back photo harness reads, `summary.md` with a row per
+photo and the totals to dial a class list against, and `photos.json` with every
+vote. The exported kinds are the model's; correct them before treating the file
+as truth.
+
 <table>
   <tr>
     <td align="center"><b>Chat</b> — a kitchen helper answering as JSON</td>

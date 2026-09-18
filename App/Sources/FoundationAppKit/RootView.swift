@@ -9,6 +9,8 @@ public struct RootView: View {
                 .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
             SampleView()
                 .tabItem { Label("Image", systemImage: "photo") }
+            PhotoBatchView()
+                .tabItem { Label("Photos", systemImage: "photo.stack") }
         }
     }
 }
